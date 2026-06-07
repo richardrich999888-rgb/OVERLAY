@@ -31,6 +31,10 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 APP = str(HERE / "vulnerable_app.py")
 MARKER = b"CONFIDENTIAL_MISSION_DATA_STREAM"
+CLIENT_ED_SEED = "11" * 32
+CLIENT_ML_SEED = "22" * 32
+SERVER_ED_SEED = "33" * 32
+SERVER_ML_SEED = "44" * 32
 
 
 def find_lib() -> str:
@@ -41,6 +45,46 @@ def find_lib() -> str:
     raise FileNotFoundError(
         "built library not found; run `cargo build --release` first"
     )
+
+
+def find_identity_tool() -> str:
+    p = ROOT / "target" / "release" / "syntriass-identity"
+    if p.exists():
+        return str(p)
+    raise FileNotFoundError(
+        "identity helper not found; run `cargo build --release` first"
+    )
+
+
+def derive_identity(tool: str, ed_seed: str, ml_seed: str) -> dict[str, str]:
+    out = subprocess.check_output([tool, ed_seed, ml_seed], text=True)
+    result: dict[str, str] = {}
+    for line in out.splitlines():
+        key, value = line.split("=", 1)
+        result[key] = value
+    return result
+
+
+def identity_env(tool: str, role: str) -> dict[str, str]:
+    client = derive_identity(tool, CLIENT_ED_SEED, CLIENT_ML_SEED)
+    server = derive_identity(tool, SERVER_ED_SEED, SERVER_ML_SEED)
+    if role == "client":
+        return {
+            "SYNTRIASS_SUITE": "0x01",
+            "SYNTRIASS_ED25519_SEED_HEX": CLIENT_ED_SEED,
+            "SYNTRIASS_MLDSA65_SEED_HEX": CLIENT_ML_SEED,
+            "SYNTRIASS_PEER_ED25519_PUB_HEX": server["ed25519_public"],
+            "SYNTRIASS_PEER_MLDSA65_PUB_HEX": server["mldsa65_public"],
+        }
+    if role == "server":
+        return {
+            "SYNTRIASS_SUITE": "0x01",
+            "SYNTRIASS_ED25519_SEED_HEX": SERVER_ED_SEED,
+            "SYNTRIASS_MLDSA65_SEED_HEX": SERVER_ML_SEED,
+            "SYNTRIASS_PEER_ED25519_PUB_HEX": client["ed25519_public"],
+            "SYNTRIASS_PEER_MLDSA65_PUB_HEX": client["mldsa65_public"],
+        }
+    raise ValueError(role)
 
 
 def free_port() -> int:
@@ -54,10 +98,12 @@ def free_port() -> int:
 class Relay:
     """Single-connection TCP relay that records all bytes in both directions."""
 
-    def __init__(self, listen_port: int, target_port: int):
+    def __init__(self, listen_port: int, target_port: int, tamper_first_client_chunk: bool = False):
         self.listen_port = listen_port
         self.target_port = target_port
         self.captured = bytearray()
+        self.tamper_first_client_chunk = tamper_first_client_chunk
+        self._tampered = False
         self._lock = threading.Lock()
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -77,6 +123,11 @@ class Relay:
                 if record:
                     with self._lock:
                         self.captured.extend(chunk)
+                    if self.tamper_first_client_chunk and not self._tampered:
+                        b = bytearray(chunk)
+                        b[-1] ^= 0x01
+                        chunk = bytes(b)
+                        self._tampered = True
                 dst.sendall(chunk)
         except OSError:
             pass
@@ -102,27 +153,40 @@ class Relay:
             return bytes(self.captured)
 
 
-def run_scenario(preload: str | None) -> tuple[bytes, str]:
-    """Returns (bytes_seen_on_wire, server_stdout)."""
+def run_scenario(
+    *,
+    lib: str | None,
+    tool: str | None,
+    preload_client: bool,
+    preload_server: bool,
+    tamper: bool = False,
+) -> tuple[bytes, str, str]:
+    """Returns (bytes_seen_on_wire, server_stdout, client_stdout)."""
     server_port = free_port()
     relay_port = free_port()
 
-    relay = Relay(relay_port, server_port)
+    relay = Relay(relay_port, server_port, tamper_first_client_chunk=tamper)
     relay.start()
 
-    env = dict(os.environ)
-    if preload:
-        env["LD_PRELOAD"] = preload
+    server_env = dict(os.environ)
+    client_env = dict(os.environ)
+    if tool:
+        server_env.update(identity_env(tool, "server"))
+        client_env.update(identity_env(tool, "client"))
+    if lib and preload_server:
+        server_env["LD_PRELOAD"] = lib
+    if lib and preload_client:
+        client_env["LD_PRELOAD"] = lib
 
     server = subprocess.Popen(
         [sys.executable, APP, "server", str(server_port)],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env=server_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
     time.sleep(0.5)  # let the server bind/listen
 
     client = subprocess.Popen(
         [sys.executable, APP, "client", str(relay_port), MARKER.decode()],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env=client_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
 
     try:
@@ -133,19 +197,23 @@ def run_scenario(preload: str | None) -> tuple[bytes, str]:
         raise
 
     server_out = server.stdout.read() if server.stdout else ""
+    client_out = client.stdout.read() if client.stdout else ""
     time.sleep(0.2)
-    return relay.wire_bytes(), server_out
+    return relay.wire_bytes(), server_out, client_out
 
 
 def main() -> int:
     try:
         lib = find_lib()
+        tool = find_identity_tool()
     except FileNotFoundError as e:
         print(f"FAIL: {e}")
         return 1
 
     print("== Scenario 1: BASELINE (no overlay) ==")
-    wire, out = run_scenario(preload=None)
+    wire, out, _client = run_scenario(
+        lib=None, tool=None, preload_client=False, preload_server=False
+    )
     print(out.strip())
     if MARKER not in wire:
         print("FAIL: baseline did not expose plaintext on the wire (test setup broken)")
@@ -153,8 +221,11 @@ def main() -> int:
     print(f"OK: plaintext marker visible on wire ({len(wire)} bytes captured)\n")
 
     print("== Scenario 2: OVERLAY (LD_PRELOAD both ends) ==")
-    wire, out = run_scenario(preload=lib)
+    wire, out, client = run_scenario(
+        lib=lib, tool=tool, preload_client=True, preload_server=True
+    )
     print(out.strip())
+    print(client.strip())
     if MARKER in wire:
         print("FAIL: marker LEAKED on the wire under overlay")
         return 1
@@ -162,6 +233,34 @@ def main() -> int:
         print("FAIL: server did not receive correct plaintext under overlay")
         return 1
     print(f"OK: wire is opaque ({len(wire)} bytes, no marker) AND server saw plaintext\n")
+
+    print("== Scenario 3: TAMPERED AUTHENTICATED HANDSHAKE ==")
+    wire, out, client = run_scenario(
+        lib=lib, tool=tool, preload_client=True, preload_server=True, tamper=True
+    )
+    print(out.strip())
+    print(client.strip())
+    if MARKER in out.encode():
+        print("FAIL: server accepted plaintext after tampered handshake")
+        return 1
+    if MARKER in wire:
+        print("FAIL: application marker reached wire after tampered handshake")
+        return 1
+    print("OK: tampered handshake failed closed before application data\n")
+
+    print("== Scenario 4: UNAUTHENTICATED CLIENT REJECTED ==")
+    wire, out, client = run_scenario(
+        lib=lib, tool=tool, preload_client=False, preload_server=True
+    )
+    print(out.strip())
+    print(client.strip())
+    if MARKER.decode() in out:
+        print("FAIL: preloaded server delivered unauthenticated plaintext to app")
+        return 1
+    if MARKER not in wire:
+        print("FAIL: unauthenticated client scenario did not send baseline marker")
+        return 1
+    print("OK: server rejected unauthenticated plaintext instead of delivering it\n")
 
     print("ALL CHECKS PASSED")
     return 0

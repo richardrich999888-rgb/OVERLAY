@@ -14,15 +14,36 @@ mod generic;
 pub mod nist1024;
 pub mod nist768;
 
+use ed25519_dalek::{
+    Signature as Ed25519Signature, Signer as Ed25519Signer, SigningKey as Ed25519SigningKey,
+    VerifyingKey as Ed25519VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH, SIGNATURE_LENGTH,
+};
 use generic::Direction;
+use ml_dsa::{
+    EncodedVerifyingKey, Keypair, MlDsa65, Signature as MlDsaSignature, Signer as MlDsaSigner,
+    SigningKey as MlDsaSigningKey, Verifier as MlDsaVerifier, VerifyingKey as MlDsaVerifyingKey,
+};
+use std::fmt;
+use zeroize::Zeroize;
 
 /// X25519 public-key length, shared by all suites.
 pub const X25519_LEN: usize = 32;
+/// This build authenticates handshakes with ML-DSA-65.
+pub const MLDSA65_PUBLIC_LEN: usize = 1952;
+pub const MLDSA65_SIGNATURE_LEN: usize = 3309;
+pub const MLDSA65_SEED_LEN: usize = 32;
+pub const ED25519_PUBLIC_LEN: usize = PUBLIC_KEY_LENGTH;
+pub const ED25519_SIGNATURE_LEN: usize = SIGNATURE_LENGTH;
+pub const ED25519_SEED_LEN: usize = SECRET_KEY_LENGTH;
+pub const IDENTITY_PUBLIC_LEN: usize = ED25519_PUBLIC_LEN + MLDSA65_PUBLIC_LEN;
+pub const IDENTITY_SIGNATURE_LEN: usize = ED25519_SIGNATURE_LEN + MLDSA65_SIGNATURE_LEN;
 
 /// Errors that never panic the host process.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CryptoError {
     BadHelloLength,
+    BadIdentityConfig,
+    Authentication,
     MlKemDecode,
     Decapsulate,
     Hkdf,
@@ -38,6 +59,12 @@ pub struct SessionKeys {
     rx: Direction,
 }
 
+impl fmt::Debug for SessionKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionKeys").finish_non_exhaustive()
+    }
+}
+
 impl SessionKeys {
     /// Encrypt one outbound application record.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
@@ -50,8 +77,12 @@ impl SessionKeys {
 }
 
 /// Retained initiator handshake state. Consumed by `finish`.
-pub trait InitiatorState {
-    fn finish(self: Box<Self>, server_hello: &[u8]) -> Result<SessionKeys, CryptoError>;
+pub trait InitiatorState: Send {
+    fn finish(
+        self: Box<Self>,
+        identity: &IdentityMaterial,
+        server_hello: &[u8],
+    ) -> Result<SessionKeys, CryptoError>;
 }
 
 /// A negotiable cryptographic suite. Trait objects are stored per-fd so the
@@ -60,9 +91,16 @@ pub trait SovereignCryptoEngine: Send + Sync {
     /// Wire identifier for this suite.
     fn suite_id(&self) -> u8;
     /// Initiator: produce retained state + ClientHello body.
-    fn begin_initiator(&self) -> (Box<dyn InitiatorState>, Vec<u8>);
+    fn begin_initiator(
+        &self,
+        identity: &IdentityMaterial,
+    ) -> Result<(Box<dyn InitiatorState>, Vec<u8>), CryptoError>;
     /// Responder: consume ClientHello body -> session keys + ServerHello body.
-    fn respond(&self, client_hello: &[u8]) -> Result<(SessionKeys, Vec<u8>), CryptoError>;
+    fn respond(
+        &self,
+        identity: &IdentityMaterial,
+        client_hello: &[u8],
+    ) -> Result<(SessionKeys, Vec<u8>), CryptoError>;
 }
 
 /// The set of suites this build knows about. No legacy/no-PQC variant exists.
@@ -97,6 +135,144 @@ impl CipherSuite {
     }
 }
 
+/// Long-term local identity plus the exact peer identity this process trusts.
+/// Secret signing keys are intentionally not cached process-wide by the
+/// interceptor; each handshake loads them and drops them after use.
+pub struct IdentityMaterial {
+    own_ed25519: Ed25519SigningKey,
+    own_mldsa65: MlDsaSigningKey<MlDsa65>,
+    own_ed25519_public: [u8; ED25519_PUBLIC_LEN],
+    own_mldsa65_public: Vec<u8>,
+    peer_ed25519: Ed25519VerifyingKey,
+    peer_mldsa65: MlDsaVerifyingKey<MlDsa65>,
+    peer_ed25519_public: [u8; ED25519_PUBLIC_LEN],
+    peer_mldsa65_public: Vec<u8>,
+}
+
+impl fmt::Debug for IdentityMaterial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IdentityMaterial")
+            .field("own_ed25519_public", &hex_preview(&self.own_ed25519_public))
+            .field("own_mldsa65_public_len", &self.own_mldsa65_public.len())
+            .field(
+                "peer_ed25519_public",
+                &hex_preview(&self.peer_ed25519_public),
+            )
+            .field("peer_mldsa65_public_len", &self.peer_mldsa65_public.len())
+            .finish()
+    }
+}
+
+pub struct IdentitySignatures {
+    pub ed25519: [u8; ED25519_SIGNATURE_LEN],
+    pub mldsa65: Vec<u8>,
+}
+
+impl IdentityMaterial {
+    pub fn from_bytes(
+        mut own_ed25519_seed: [u8; ED25519_SEED_LEN],
+        mut own_mldsa65_seed: [u8; MLDSA65_SEED_LEN],
+        peer_ed25519_public: [u8; ED25519_PUBLIC_LEN],
+        peer_mldsa65_public: Vec<u8>,
+    ) -> Result<Self, CryptoError> {
+        if peer_mldsa65_public.len() != MLDSA65_PUBLIC_LEN {
+            return Err(CryptoError::BadIdentityConfig);
+        }
+
+        let own_ed25519 = Ed25519SigningKey::from_bytes(&own_ed25519_seed);
+        let own_ed25519_public = own_ed25519.verifying_key().to_bytes();
+
+        let mut mldsa_seed = ml_dsa::Seed::try_from(&own_mldsa65_seed[..])
+            .map_err(|_| CryptoError::BadIdentityConfig)?;
+        let own_mldsa65 = MlDsaSigningKey::<MlDsa65>::from_seed(&mldsa_seed);
+        mldsa_seed.zeroize();
+        let own_mldsa65_public = own_mldsa65.verifying_key().encode().as_slice().to_vec();
+        own_ed25519_seed.zeroize();
+        own_mldsa65_seed.zeroize();
+
+        let peer_ed25519 = Ed25519VerifyingKey::from_bytes(&peer_ed25519_public)
+            .map_err(|_| CryptoError::BadIdentityConfig)?;
+        let peer_mldsa65_enc =
+            EncodedVerifyingKey::<MlDsa65>::try_from(peer_mldsa65_public.as_slice())
+                .map_err(|_| CryptoError::BadIdentityConfig)?;
+        let peer_mldsa65 = MlDsaVerifyingKey::<MlDsa65>::decode(&peer_mldsa65_enc);
+
+        Ok(Self {
+            own_ed25519,
+            own_mldsa65,
+            own_ed25519_public,
+            own_mldsa65_public,
+            peer_ed25519,
+            peer_mldsa65,
+            peer_ed25519_public,
+            peer_mldsa65_public,
+        })
+    }
+
+    pub fn own_ed25519_public(&self) -> &[u8; ED25519_PUBLIC_LEN] {
+        &self.own_ed25519_public
+    }
+
+    pub fn own_mldsa65_public(&self) -> &[u8] {
+        &self.own_mldsa65_public
+    }
+
+    pub fn sign(&self, transcript: &[u8]) -> Result<IdentitySignatures, CryptoError> {
+        let ed_sig: Ed25519Signature = self
+            .own_ed25519
+            .try_sign(transcript)
+            .map_err(|_| CryptoError::Authentication)?;
+        let ml_sig: MlDsaSignature<MlDsa65> = self
+            .own_mldsa65
+            .try_sign(transcript)
+            .map_err(|_| CryptoError::Authentication)?;
+        Ok(IdentitySignatures {
+            ed25519: ed_sig.to_bytes(),
+            mldsa65: ml_sig.encode().as_slice().to_vec(),
+        })
+    }
+
+    pub fn verify_peer_public_keys(
+        &self,
+        ed25519_public: &[u8],
+        mldsa65_public: &[u8],
+    ) -> Result<(), CryptoError> {
+        if ed25519_public != self.peer_ed25519_public
+            || mldsa65_public != self.peer_mldsa65_public.as_slice()
+        {
+            return Err(CryptoError::Authentication);
+        }
+        Ok(())
+    }
+
+    pub fn verify_peer_signatures(
+        &self,
+        transcript: &[u8],
+        ed25519_signature: &[u8],
+        mldsa65_signature: &[u8],
+    ) -> Result<(), CryptoError> {
+        let ed_sig = Ed25519Signature::try_from(ed25519_signature)
+            .map_err(|_| CryptoError::Authentication)?;
+        self.peer_ed25519
+            .verify_strict(transcript, &ed_sig)
+            .map_err(|_| CryptoError::Authentication)?;
+
+        let ml_sig = MlDsaSignature::<MlDsa65>::try_from(mldsa65_signature)
+            .map_err(|_| CryptoError::Authentication)?;
+        self.peer_mldsa65
+            .verify(transcript, &ml_sig)
+            .map_err(|_| CryptoError::Authentication)?;
+        Ok(())
+    }
+}
+
+impl Drop for IdentityMaterial {
+    fn drop(&mut self) {
+        self.own_ed25519_public.zeroize();
+        self.own_mldsa65_public.zeroize();
+    }
+}
+
 // ----------------------- Late-binding policy resolution -----------------------
 
 /// Resolve the process-wide active suite ONCE, from env then config file.
@@ -111,29 +287,58 @@ pub fn resolve_policy() -> Result<CipherSuite, &'static str> {
         return parse_suite_token(val.trim());
     }
     if let Ok(contents) = std::fs::read_to_string("/etc/syntriass/policy.toml") {
-        if let Some(tok) = parse_policy_file(&contents) {
-            return parse_suite_token(&tok);
+        match parse_policy_file(&contents)? {
+            Some(tok) => return parse_suite_token(&tok),
+            None => return Ok(CipherSuite::NistStandard768),
         }
     }
     Ok(CipherSuite::NistStandard768)
 }
 
+pub fn resolve_identity() -> Result<IdentityMaterial, CryptoError> {
+    let file = std::fs::read_to_string("/etc/syntriass/identity.toml").ok();
+    let own_ed_seed = read_identity_hex::<ED25519_SEED_LEN>(
+        "SYNTRIASS_ED25519_SEED_HEX",
+        "ed25519_seed",
+        file.as_deref(),
+    )?;
+    let own_ml_seed = read_identity_hex::<MLDSA65_SEED_LEN>(
+        "SYNTRIASS_MLDSA65_SEED_HEX",
+        "mldsa65_seed",
+        file.as_deref(),
+    )?;
+    let peer_ed_public = read_identity_hex::<ED25519_PUBLIC_LEN>(
+        "SYNTRIASS_PEER_ED25519_PUB_HEX",
+        "peer_ed25519_public",
+        file.as_deref(),
+    )?;
+    let peer_ml_public = read_identity_hex_vec(
+        "SYNTRIASS_PEER_MLDSA65_PUB_HEX",
+        "peer_mldsa65_public",
+        file.as_deref(),
+        MLDSA65_PUBLIC_LEN,
+    )?;
+    IdentityMaterial::from_bytes(own_ed_seed, own_ml_seed, peer_ed_public, peer_ml_public)
+}
+
 /// Minimal zero-dependency reader for a single `suite = "<value>"` line.
 /// Ignores comments (`#`), blank lines, and surrounding quotes/whitespace.
 /// We do NOT pull in a TOML crate for one key (dependency-minimization rule).
-fn parse_policy_file(contents: &str) -> Option<String> {
+fn parse_policy_file(contents: &str) -> Result<Option<String>, &'static str> {
     for raw in contents.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (key, value) = line.split_once('=')?;
+        let (key, value) = line
+            .split_once('=')
+            .ok_or("malformed SYNTRIASS policy line")?;
         if key.trim().eq_ignore_ascii_case("suite") {
             let v = value.trim().trim_matches('"').trim_matches('\'').trim();
-            return Some(v.to_string());
+            return Ok(Some(v.to_string()));
         }
     }
-    None
+    Ok(None)
 }
 
 fn parse_suite_token(tok: &str) -> Result<CipherSuite, &'static str> {
@@ -147,6 +352,90 @@ fn parse_suite_token(tok: &str) -> Result<CipherSuite, &'static str> {
     }
 }
 
+fn read_identity_hex<const N: usize>(
+    env_key: &str,
+    file_key: &str,
+    file: Option<&str>,
+) -> Result<[u8; N], CryptoError> {
+    let token = std::env::var(env_key)
+        .ok()
+        .or_else(|| file.and_then(|contents| parse_policy_value(contents, file_key)))
+        .ok_or(CryptoError::BadIdentityConfig)?;
+    decode_hex_exact::<N>(&token)
+}
+
+fn read_identity_hex_vec(
+    env_key: &str,
+    file_key: &str,
+    file: Option<&str>,
+    expected_len: usize,
+) -> Result<Vec<u8>, CryptoError> {
+    let token = std::env::var(env_key)
+        .ok()
+        .or_else(|| file.and_then(|contents| parse_policy_value(contents, file_key)))
+        .ok_or(CryptoError::BadIdentityConfig)?;
+    decode_hex_vec(&token, expected_len)
+}
+
+fn parse_policy_value(contents: &str, wanted_key: &str) -> Option<String> {
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case(wanted_key) {
+            let v = value.trim().trim_matches('"').trim_matches('\'').trim();
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn decode_hex_exact<const N: usize>(token: &str) -> Result<[u8; N], CryptoError> {
+    let mut bytes = decode_hex_vec(token, N)?;
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes);
+    bytes.zeroize();
+    Ok(out)
+}
+
+fn decode_hex_vec(token: &str, expected_len: usize) -> Result<Vec<u8>, CryptoError> {
+    let compact: String = token.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let hex = compact
+        .strip_prefix("0x")
+        .or_else(|| compact.strip_prefix("0X"))
+        .unwrap_or(&compact);
+    if hex.len() != expected_len * 2 {
+        return Err(CryptoError::BadIdentityConfig);
+    }
+    let mut out = vec![0u8; expected_len];
+    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(chunk[0]).ok_or(CryptoError::BadIdentityConfig)?;
+        let low = hex_nibble(chunk[1]).ok_or(CryptoError::BadIdentityConfig)?;
+        out[idx] = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_preview(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(16);
+    for b in bytes.iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
 // ----------------------------------- tests -----------------------------------
 
 #[cfg(test)]
@@ -155,12 +444,61 @@ mod verification_tests {
 
     /// Run a full handshake for one suite and return the two key sets.
     fn handshake(suite: CipherSuite) -> (SessionKeys, SessionKeys) {
+        let (client_identity, server_identity) = identities();
         let engine = suite.engine();
-        let (init_state, client_hello) = engine.begin_initiator();
-        let (server_keys, server_hello) =
-            engine.respond(&client_hello).expect("responder accepts hello");
-        let client_keys = init_state.finish(&server_hello).expect("initiator finishes");
+        let (init_state, client_hello) = engine
+            .begin_initiator(&client_identity)
+            .expect("client hello");
+        let (server_keys, server_hello) = engine
+            .respond(&server_identity, &client_hello)
+            .expect("responder accepts hello");
+        let client_keys = init_state
+            .finish(&client_identity, &server_hello)
+            .expect("initiator finishes");
         (client_keys, server_keys)
+    }
+
+    fn identities() -> (IdentityMaterial, IdentityMaterial) {
+        let client_ed = [0x11u8; ED25519_SEED_LEN];
+        let client_ml = [0x22u8; MLDSA65_SEED_LEN];
+        let server_ed = [0x33u8; ED25519_SEED_LEN];
+        let server_ml = [0x44u8; MLDSA65_SEED_LEN];
+        identity_pair(client_ed, client_ml, server_ed, server_ml)
+    }
+
+    fn identity_pair(
+        client_ed_seed: [u8; ED25519_SEED_LEN],
+        client_ml_seed: [u8; MLDSA65_SEED_LEN],
+        server_ed_seed: [u8; ED25519_SEED_LEN],
+        server_ml_seed: [u8; MLDSA65_SEED_LEN],
+    ) -> (IdentityMaterial, IdentityMaterial) {
+        let client_ed_key = Ed25519SigningKey::from_bytes(&client_ed_seed);
+        let client_ml_arr = ml_dsa::Seed::try_from(&client_ml_seed[..]).unwrap();
+        let client_ml_key = MlDsaSigningKey::<MlDsa65>::from_seed(&client_ml_arr);
+        let server_ed_key = Ed25519SigningKey::from_bytes(&server_ed_seed);
+        let server_ml_arr = ml_dsa::Seed::try_from(&server_ml_seed[..]).unwrap();
+        let server_ml_key = MlDsaSigningKey::<MlDsa65>::from_seed(&server_ml_arr);
+
+        let client_ed_pub = client_ed_key.verifying_key().to_bytes();
+        let client_ml_pub = client_ml_key.verifying_key().encode().as_slice().to_vec();
+        let server_ed_pub = server_ed_key.verifying_key().to_bytes();
+        let server_ml_pub = server_ml_key.verifying_key().encode().as_slice().to_vec();
+
+        let client = IdentityMaterial::from_bytes(
+            client_ed_seed,
+            client_ml_seed,
+            server_ed_pub,
+            server_ml_pub,
+        )
+        .unwrap();
+        let server = IdentityMaterial::from_bytes(
+            server_ed_seed,
+            server_ml_seed,
+            client_ed_pub,
+            client_ml_pub,
+        )
+        .unwrap();
+        (client, server)
     }
 
     /// Agility: cycle every suite in one run; each yields a working channel.
@@ -190,8 +528,14 @@ mod verification_tests {
     /// Suite ids are distinct and round-trip through from_id.
     #[test]
     fn suite_id_mapping() {
-        assert_eq!(CipherSuite::from_id(0x01), Some(CipherSuite::NistStandard768));
-        assert_eq!(CipherSuite::from_id(0x02), Some(CipherSuite::NistStandard1024));
+        assert_eq!(
+            CipherSuite::from_id(0x01),
+            Some(CipherSuite::NistStandard768)
+        );
+        assert_eq!(
+            CipherSuite::from_id(0x02),
+            Some(CipherSuite::NistStandard1024)
+        );
         assert_eq!(CipherSuite::from_id(0xFF), None);
     }
 
@@ -226,20 +570,87 @@ mod verification_tests {
     /// Malformed ClientHello length is rejected, not panicked.
     #[test]
     fn malformed_hello_rejected() {
+        let (_client_identity, server_identity) = identities();
         let engine = CipherSuite::NistStandard768.engine();
-        assert_eq!(engine.respond(&[0u8; 10]).unwrap_err(), CryptoError::BadHelloLength);
+        assert_eq!(
+            engine.respond(&server_identity, &[0u8; 10]).unwrap_err(),
+            CryptoError::BadHelloLength
+        );
+    }
+
+    #[test]
+    fn unauthenticated_client_hello_rejected() {
+        let (client_identity, server_identity) = identities();
+        let engine = CipherSuite::NistStandard768.engine();
+        let (_state, mut client_hello) = engine
+            .begin_initiator(&client_identity)
+            .expect("client hello");
+        let last = client_hello.len() - 1;
+        client_hello[last] ^= 0x01;
+        assert_eq!(
+            engine.respond(&server_identity, &client_hello).unwrap_err(),
+            CryptoError::Authentication
+        );
+    }
+
+    #[test]
+    fn untrusted_client_identity_rejected() {
+        let (client_identity, _server_identity) = identities();
+        let (_trusted_client, server_identity) = identity_pair(
+            [0x55; ED25519_SEED_LEN],
+            [0x66; MLDSA65_SEED_LEN],
+            [0x33; ED25519_SEED_LEN],
+            [0x44; MLDSA65_SEED_LEN],
+        );
+        let engine = CipherSuite::NistStandard768.engine();
+        let (_state, client_hello) = engine
+            .begin_initiator(&client_identity)
+            .expect("client hello");
+        assert_eq!(
+            engine.respond(&server_identity, &client_hello).unwrap_err(),
+            CryptoError::Authentication
+        );
     }
 
     /// Policy parsing: env tokens and file lines map to the right suites.
     #[test]
     fn policy_token_parsing() {
-        assert_eq!(parse_suite_token("0x01").unwrap(), CipherSuite::NistStandard768);
-        assert_eq!(parse_suite_token("1024").unwrap(), CipherSuite::NistStandard1024);
-        assert_eq!(parse_suite_token("NIST768").unwrap(), CipherSuite::NistStandard768);
+        assert_eq!(
+            parse_suite_token("0x01").unwrap(),
+            CipherSuite::NistStandard768
+        );
+        assert_eq!(
+            parse_suite_token("1024").unwrap(),
+            CipherSuite::NistStandard1024
+        );
+        assert_eq!(
+            parse_suite_token("NIST768").unwrap(),
+            CipherSuite::NistStandard768
+        );
         assert!(parse_suite_token("legacy-aes").is_err());
 
         let file = "# policy\n\nsuite = \"nist1024\"\n";
-        assert_eq!(parse_policy_file(file).as_deref(), Some("nist1024"));
-        assert_eq!(parse_policy_file("# nothing here\n"), None);
+        assert_eq!(
+            parse_policy_file(file).unwrap().as_deref(),
+            Some("nist1024")
+        );
+        assert_eq!(parse_policy_file("# nothing here\n").unwrap(), None);
+        assert!(parse_policy_file("not toml").is_err());
+    }
+
+    #[test]
+    fn identity_wire_lengths_match_fips_204_mldsa65() {
+        let (client_identity, _server_identity) = identities();
+        assert_eq!(
+            client_identity.own_ed25519_public().len(),
+            ED25519_PUBLIC_LEN
+        );
+        assert_eq!(
+            client_identity.own_mldsa65_public().len(),
+            MLDSA65_PUBLIC_LEN
+        );
+        let sigs = client_identity.sign(b"length-test").unwrap();
+        assert_eq!(sigs.ed25519.len(), ED25519_SIGNATURE_LEN);
+        assert_eq!(sigs.mldsa65.len(), MLDSA65_SIGNATURE_LEN);
     }
 }

@@ -27,6 +27,12 @@ aes-gcm = "=0.10.3"
 # Key schedule.
 hkdf = "=0.12.4"
 sha2 = "=0.10.8"
+# Classical identity signatures.
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core", "zeroize"] }
+# Post-quantum identity signatures (FIPS 204 ML-DSA-65).
+ml-dsa = { version = "=0.1.1", features = ["getrandom", "zeroize"] }
+# Explicit scrubbing of key material and plaintext buffers.
+zeroize = { version = "=1.8.2", features = ["derive"] }
 
 [dev-dependencies]
 # For deterministic unit tests we feed fixed seeds through a seedable RNG.

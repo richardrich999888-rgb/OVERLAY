@@ -1,8 +1,9 @@
 # syntriass-overlay
 
-A **Linux-only** `LD_PRELOAD` proof-of-concept that transparently wraps a POSIX
-stream socket in a **runtime-agile hybrid post-quantum tunnel** (X25519 + ML-KEM,
-HKDF-SHA256 schedule, AES-256-GCM records) **without modifying the application**.
+A **Linux-only** `LD_PRELOAD` runtime layer that transparently wraps a POSIX
+stream socket in an **authenticated, runtime-agile hybrid post-quantum tunnel**
+(X25519 + ML-KEM, Ed25519 + ML-DSA-65 identity signatures, HKDF-SHA256 schedule,
+AES-256-GCM records) **without modifying the application**.
 
 ## Cipher agility (this revision)
 
@@ -14,6 +15,31 @@ The active suite is **late-bound** at process start and pinned for the process:
 
 Suites: `NistStandard768` (id `0x01`) and `NistStandard1024` (id `0x02`).
 **There is no legacy/no-PQC suite and no wire-negotiable downgrade.**
+
+## Mandatory peer authentication
+
+Every handshake is signed by both peers with long-term identity keys:
+
+- Ed25519 for classical identity authentication
+- ML-DSA-65 for post-quantum identity authentication
+
+Each process must be configured with its own signing seeds and the exact peer
+public keys it trusts, either through environment variables or
+`/etc/syntriass/identity.toml`. Missing or malformed identity material fails
+closed; the overlay does not run anonymously.
+
+Environment variables:
+
+- `SYNTRIASS_ED25519_SEED_HEX`
+- `SYNTRIASS_MLDSA65_SEED_HEX`
+- `SYNTRIASS_PEER_ED25519_PUB_HEX`
+- `SYNTRIASS_PEER_MLDSA65_PUB_HEX`
+
+The `syntriass-identity` helper derives public keys from local seeds:
+
+```bash
+cargo run --release --bin syntriass-identity -- <ed25519-seed-hex> <mldsa65-seed-hex>
+```
 
 ### Negotiation = fail closed
 The initiator proposes its policy suite in the ClientHello. The responder accepts
@@ -40,15 +66,18 @@ u8               TYPE      (1=ClientHello, 2=ServerHello, 3=Data)
 syntriass-overlay/
 ├── Cargo.toml
 ├── policy.toml.example
+├── identity.toml.example
 ├── src/
+│   ├── bin/
+│   │   └── syntriass-identity.rs
 │   ├── lib.rs              # crate root
 │   ├── crypto/
 │   │   ├── mod.rs          # trait, CipherSuite, policy reader, SessionKeys, tests
 │   │   ├── generic.rs      # shared X25519+ML-KEM core (generic over KemCore) + tests
 │   │   ├── nist768.rs      # suite 0x01
 │   │   └── nist1024.rs     # suite 0x02
-│   ├── fd_state.rs         # per-fd state machine (dynamic engine) + registry
-│   └── interceptor.rs      # connect/send/recv hooks, framing, negotiation, blocking I/O
+│   ├── fd_state.rs         # per-fd state machine, bounded buffers + registry
+│   └── interceptor.rs      # connect/send/recv/read/write/readv/writev/sendmsg/recvmsg hooks
 └── tests/
     ├── vulnerable_app.py
     └── verify_wire.py
@@ -56,24 +85,23 @@ syntriass-overlay/
 
 ## Honest status
 
-- **Not compiled here.** This was written against the verified `ml-kem` 0.2.3 and
-  `x25519-dalek` 2.0.1 APIs, but the author's environment had no Rust toolchain.
-  **You must `cargo test` / `cargo build` to confirm.**
+- The crate is Linux/glibc-oriented. Unit tests compile on macOS for development,
+  but the production shared object must be validated in a Linux/glibc runtime.
 - **Known compile-risk points:** the two `try_from` conversions in
   `src/crypto/generic.rs` (encapsulation key and ciphertext). If the compiler
   reports an unsatisfied `TryFrom<&[u8]>` bound (RustCrypto/hybrid-array#114), the
   inline comments give the one-line fix (`ml_kem::array::Array::try_from`).
 - `ml-kem` is itself **unaudited** (upstream says so). PoC only. Not "mathematically
   proven safe" — only the API shapes were verified against docs.rs.
-- No peer authentication (no signatures/PSK): vulnerable to active MITM at handshake.
-  Hardening = add ML-DSA signatures or a PSK. Documented, not done.
-- Only `connect`/`send`/`recv` are hooked. `write`/`read`/`sendmsg` bypass the tunnel.
+- `connect`, `send`, `recv`, `write`, `read`, `writev`, `readv`, `sendmsg`,
+  `recvmsg`, and `close` are hooked. Applications using unrelated syscalls or
+  direct kernel interfaces outside libc interposition are out of scope.
 
 ## Build & test (Linux, or in a container on Apple Silicon)
 
 ```bash
 docker run --rm -it -v "$PWD":/w -w /w/syntriass-overlay \
-  rust:1.78-slim-bookworm bash -lc '
+  rust:1.85-slim-bookworm bash -lc '
     apt-get update && apt-get install -y python3 build-essential &&
     cargo test --release &&            # crypto agility + MITM + policy tests (no sockets)
     cargo build --release &&           # -> target/release/libsyntriass_overlay.so

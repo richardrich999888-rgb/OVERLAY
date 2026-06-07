@@ -3,7 +3,7 @@
 use ml_kem::MlKem1024;
 
 use super::generic::{self, GenericInitiatorState};
-use super::{CryptoError, InitiatorState, SessionKeys, SovereignCryptoEngine};
+use super::{CryptoError, IdentityMaterial, InitiatorState, SessionKeys, SovereignCryptoEngine};
 
 /// FIPS 203 ML-KEM-1024 wire sizes (verified on docs.rs: pk 1568, ct 1568).
 const EK_LEN: usize = 1568;
@@ -15,8 +15,12 @@ pub struct Nist1024Engine;
 struct Nist1024Init(GenericInitiatorState<MlKem1024>);
 
 impl InitiatorState for Nist1024Init {
-    fn finish(self: Box<Self>, server_hello: &[u8]) -> Result<SessionKeys, CryptoError> {
-        generic::finish::<MlKem1024>(self.0, CT_LEN, server_hello)
+    fn finish(
+        self: Box<Self>,
+        identity: &IdentityMaterial,
+        server_hello: &[u8],
+    ) -> Result<SessionKeys, CryptoError> {
+        generic::finish::<MlKem1024>(self.0, CT_LEN, identity, server_hello)
     }
 }
 
@@ -25,12 +29,19 @@ impl SovereignCryptoEngine for Nist1024Engine {
         SUITE_ID
     }
 
-    fn begin_initiator(&self) -> (Box<dyn InitiatorState>, Vec<u8>) {
-        let (state, hello) = generic::client_hello::<MlKem1024>(SUITE_ID);
-        (Box::new(Nist1024Init(state)), hello)
+    fn begin_initiator(
+        &self,
+        identity: &IdentityMaterial,
+    ) -> Result<(Box<dyn InitiatorState>, Vec<u8>), CryptoError> {
+        let (state, hello) = generic::client_hello::<MlKem1024>(SUITE_ID, identity)?;
+        Ok((Box::new(Nist1024Init(state)), hello))
     }
 
-    fn respond(&self, client_hello: &[u8]) -> Result<(SessionKeys, Vec<u8>), CryptoError> {
-        generic::respond::<MlKem1024>(SUITE_ID, EK_LEN, client_hello)
+    fn respond(
+        &self,
+        identity: &IdentityMaterial,
+        client_hello: &[u8],
+    ) -> Result<(SessionKeys, Vec<u8>), CryptoError> {
+        generic::respond::<MlKem1024>(SUITE_ID, EK_LEN, identity, client_hello)
     }
 }

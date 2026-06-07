@@ -13,6 +13,7 @@ The server accepts one connection, prints the received plaintext, echoes it.
 """
 import socket
 import sys
+import os
 
 SECRET_DEFAULT = "CONFIDENTIAL_MISSION_DATA_STREAM"
 
@@ -24,10 +25,10 @@ def run_server(port: int) -> int:
     srv.listen(1)
     print(f"[server] listening on 127.0.0.1:{port}", flush=True)
     conn, _ = srv.accept()
-    data = conn.recv(4096)
+    data, _anc, _flags, _addr = conn.recvmsg(4096)
     text = data.decode("utf-8", errors="replace")
     print(f"[server] received plaintext: {text}", flush=True)
-    conn.sendall(b"ACK:" + data)  # echo so the client can verify the round trip
+    os.writev(conn.fileno(), [b"ACK:", data])
     conn.close()
     srv.close()
     return 0
@@ -36,8 +37,10 @@ def run_server(port: int) -> int:
 def run_client(port: int, message: str) -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect(("127.0.0.1", port))
-    s.sendall(message.encode("utf-8"))
-    echo = s.recv(4096)
+    msg = message.encode("utf-8")
+    mid = max(1, len(msg) // 2)
+    s.sendmsg([msg[:mid], msg[mid:]])
+    echo = os.read(s.fileno(), 4096)
     print(f"[client] received echo: {echo.decode('utf-8', errors='replace')}", flush=True)
     s.close()
     return 0
