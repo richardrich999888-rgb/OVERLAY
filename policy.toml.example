@@ -1,0 +1,7 @@
+# Syntriass overlay policy. Copy to /etc/syntriass/policy.toml.
+# Selects the process-wide, policy-pinned cipher suite.
+# Accepted values: nist768 | nist1024 | 768 | 1024 | 0x01 | 0x02
+#
+# This is read ONCE at process start. The SYNTRIASS_SUITE env var, if set,
+# overrides this file. There is no legacy/no-PQC suite and no wire downgrade.
+suite = "nist768"

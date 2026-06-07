@@ -1,0 +1,37 @@
+[package]
+name = "syntriass-overlay"
+version = "0.1.0"
+edition = "2021"
+description = "Linux LD_PRELOAD transparent hybrid (X25519 + ML-KEM-768) encryption tunnel for POSIX stream sockets. PoC."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "syntriass_overlay"
+crate-type = ["cdylib", "rlib"]
+# cdylib: the LD_PRELOAD .so.  rlib: lets `cargo test` link crypto.rs unit tests.
+
+[dependencies]
+# Raw FFI: dlsym/RTLD_NEXT, errno, fcntl, the real send/recv/connect. No SHA, no crypto here.
+libc = "=0.2.155"
+# One-time, race-free interior init of the original symbol pointers.
+once_cell = "=1.19.0"
+# Verified against docs.rs: ml-kem 0.2.3 depends on rand_core ^0.6.4 internally.
+ml-kem = "=0.2.3"
+# Verified: x25519-dalek 2.0.1 uses rand_core 0.6; `getrandom` feature exposes EphemeralSecret::random().
+x25519-dalek = { version = "=2.0.1", features = ["getrandom"] }
+# rand_core 0.6 OsRng is accepted by BOTH ml-kem (CryptoRngCore) and x25519 (RngCore+CryptoRng).
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+# AEAD payload cipher.
+aes-gcm = "=0.10.3"
+# Key schedule.
+hkdf = "=0.12.4"
+sha2 = "=0.10.8"
+
+[dev-dependencies]
+# For deterministic unit tests we feed fixed seeds through a seedable RNG.
+rand = "=0.8.5"
+
+[profile.release]
+panic = "abort"   # A panic across the FFI boundary is UB; abort instead.
+opt-level = 3
