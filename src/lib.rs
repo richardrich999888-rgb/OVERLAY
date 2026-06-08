@@ -11,6 +11,8 @@
 pub mod crypto;
 pub mod fd_state;
 pub mod interceptor;
+pub mod kernel_native;
+pub mod telemetry;
 
 /// Starts the Linux configuration hot-reload worker.
 ///

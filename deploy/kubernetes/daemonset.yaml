@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: syntriass-kernel-engine
+  namespace: syntriass-system
+  labels:
+    app.kubernetes.io/name: syntriass
+    app.kubernetes.io/component: kernel-engine
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: syntriass
+      app.kubernetes.io/component: kernel-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: syntriass
+        app.kubernetes.io/component: kernel-engine
+    spec:
+      hostNetwork: true
+      hostPID: true
+      serviceAccountName: syntriass-kernel-engine
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: daemon
+          image: syntriass/kernel-engine:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/daemon"]
+          env:
+            - name: SYNTRIASS_UPCALL_SOCKET
+              value: /var/run/syntriass/syntriass.sock
+            - name: SYNTRIASS_CONFIG_DIR
+              value: /etc/syntriass
+          ports:
+            - name: metrics
+              containerPort: 9090
+          securityContext:
+            privileged: true
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: run
+              mountPath: /var/run/syntriass
+            - name: config
+              mountPath: /etc/syntriass
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: modules
+              mountPath: /lib/modules
+              readOnly: true
+      volumes:
+        - name: run
+          hostPath:
+            path: /var/run/syntriass
+            type: DirectoryOrCreate
+        - name: config
+          secret:
+            secretName: syntriass-identity-policy
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate
+        - name: modules
+          hostPath:
+            path: /lib/modules
+            type: Directory

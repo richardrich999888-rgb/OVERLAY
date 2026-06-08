@@ -87,6 +87,35 @@ on internal links, harden legacy services that cannot be modified quickly, and
 fail closed when identity, policy, framing, or cryptographic verification does
 not match the configured trust policy.
 
+## Syntriass Architecture v2.0: Kernel Native Scaffold
+
+This repository now includes the initial split-plane implementation path for a
+kernel-native Syntriass engine:
+
+- `ebpf/src/main.rs` and `ebpf/src/maps.rs` define the sockops interposer,
+  secure-socket map, and kernel counter layout for an Aya-based eBPF program.
+- `src/bin/daemon.rs` is the user-space control daemon. It listens on
+  `/var/run/syntriass.sock` by default, accepts JSON kernel upcalls, resolves the
+  configured suite, runs the existing X25519 plus ML-KEM handshake machinery,
+  and returns explicit fail-closed responses while kTLS key installation is
+  still being wired.
+- `src/kernel_native.rs` contains the daemon-side contract for parsing upcalls,
+  classifying sockets, resolving cryptographic policy, and installing kTLS keys.
+- `src/telemetry.rs` exposes v2 Prometheus metric names and isolates the future
+  eBPF map reader behind a small `read_ebpf_atomic_telemetry_maps` function.
+- `deploy/kubernetes/daemonset.yaml` deploys a privileged per-node kernel engine
+  with access to `/sys/fs/bpf`, `/var/run/syntriass`, and mounted identity
+  policy.
+- `src/bin/webhook.rs` supports `SYNTRIASS_WEBHOOK_MODE=kernel-native`, which
+  labels/annotates pods for kernel-native enforcement instead of injecting
+  `LD_PRELOAD`.
+
+The current v2 code is a scaffold, not a completed kernel bypass-proof release.
+The missing production pieces are the Aya loader, real eBPF ring-buffer or map
+upcalls, socket-reference transfer into the daemon, and Linux kTLS
+`setsockopt(2)` key installation. Until those are added, kTLS installation fails
+closed by design rather than pretending plaintext is protected.
+
 ## Product Description
 
 Many operational systems still depend on applications that speak plaintext over
