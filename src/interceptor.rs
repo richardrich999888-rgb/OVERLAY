@@ -7,11 +7,13 @@
 //! failed so later I/O returns an error instead of leaking plaintext.
 
 use crate::crypto::{self, CipherSuite};
-use crate::fd_state::{current_pid, FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY};
+use crate::fd_state::{
+    current_pid, record_blocked_bypass_attempt, FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY,
+};
 #[cfg(target_os = "linux")]
 use libc::c_uint;
 use libc::{c_int, c_void, iovec, msghdr, size_t, ssize_t};
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::{cmp, ptr, slice};
@@ -120,6 +122,18 @@ struct RealSyms {
 }
 
 static REAL: OnceCell<RealSyms> = OnceCell::new();
+static INTERPOSITION_ENABLED: Lazy<bool> = Lazy::new(|| {
+    let Ok(preload) = std::env::var("LD_PRELOAD") else {
+        return false;
+    };
+    preload
+        .split([':', ' '])
+        .any(|entry| entry.contains("syntriass_overlay") || entry.contains("syntriass-overlay"))
+});
+
+fn interposition_enabled() -> bool {
+    *INTERPOSITION_ENABLED
+}
 
 unsafe fn resolve<T>(name: &[u8]) -> T {
     let p = libc::dlsym(libc::RTLD_NEXT, name.as_ptr() as *const libc::c_char);
@@ -202,6 +216,7 @@ unsafe fn is_stream_socket(fd: c_int) -> bool {
 
 unsafe fn block_stream_egress(fd: c_int) -> bool {
     if is_stream_socket(fd) {
+        record_blocked_bypass_attempt();
         set_errno(libc::EOPNOTSUPP);
         return true;
     }
@@ -302,7 +317,7 @@ fn drive_handshake(st: &mut FdState) {
             Ok(Some(f)) => f,
             Ok(None) => return,
             Err(()) => {
-                st.phase = FdPhase::Failed;
+                st.fail_closed();
                 return;
             }
         };
@@ -324,29 +339,29 @@ fn drive_handshake(st: &mut FdState) {
                                 )
                                 .is_ok()
                                 {
-                                    st.phase = FdPhase::Active(keys);
+                                    st.activate(keys);
                                 } else {
-                                    st.phase = FdPhase::Failed;
+                                    st.fail_closed();
                                 }
                             }
-                            Err(_) => st.phase = FdPhase::Failed,
+                            Err(_) => st.fail_closed(),
                         }
                     }
-                    _ => st.phase = FdPhase::Failed,
+                    _ => st.fail_closed(),
                 }
             }
             (FdPhase::InitiatorAwaitingServerHello(state), TYPE_SERVER_HELLO) => {
                 match crypto::resolve_identity() {
                     Ok(identity) if f.suite_id == st.policy_suite.id() => {
                         match state.finish(&identity, &f.payload) {
-                            Ok(keys) => st.phase = FdPhase::Active(keys),
-                            Err(_) => st.phase = FdPhase::Failed,
+                            Ok(keys) => st.activate(keys),
+                            Err(_) => st.fail_closed(),
                         }
                     }
-                    _ => st.phase = FdPhase::Failed,
+                    _ => st.fail_closed(),
                 }
             }
-            _ => st.phase = FdPhase::Failed,
+            _ => st.fail_closed(),
         }
 
         if matches!(st.phase, FdPhase::Failed | FdPhase::Active(_)) {
@@ -414,7 +429,7 @@ unsafe fn drive_until_active_for_write(
     blocking: bool,
 ) -> Result<(), c_int> {
     if flush_backlog(fd, st, flags).is_err() {
-        st.phase = FdPhase::Failed;
+        st.fail_closed();
         return Err(libc::EIO);
     }
     loop {
@@ -429,14 +444,14 @@ unsafe fn drive_until_active_for_write(
                 Ok(false) if !blocking => return Err(libc::EAGAIN),
                 Ok(false) => continue,
                 Err(()) => {
-                    st.phase = FdPhase::Failed;
+                    st.fail_closed();
                     return Err(libc::EIO);
                 }
             }
         }
         match pull_wire(fd, st, flags) {
             Ok(0) => {
-                st.phase = FdPhase::Failed;
+                st.fail_closed();
                 return Err(libc::EPIPE);
             }
             Ok(n) if n > 0 => drive_handshake(st),
@@ -446,12 +461,12 @@ unsafe fn drive_until_active_for_write(
                     return Err(e);
                 }
                 if e != libc::EAGAIN && e != libc::EWOULDBLOCK {
-                    st.phase = FdPhase::Failed;
+                    st.fail_closed();
                     return Err(e);
                 }
             }
             Err(()) => {
-                st.phase = FdPhase::Failed;
+                st.fail_closed();
                 return Err(libc::EPIPE);
             }
         }
@@ -473,7 +488,7 @@ unsafe fn append_or_flush(
         Ok(false) if !blocking => return Err(libc::EAGAIN),
         Ok(false) => {}
         Err(()) => {
-            st.phase = FdPhase::Failed;
+            st.fail_closed();
             return Err(libc::EIO);
         }
     }
@@ -518,13 +533,13 @@ unsafe fn overlay_send(fd: c_int, plaintext: &[u8], flags: c_int) -> ssize_t {
             FdPhase::Active(keys) => match keys.seal(&plaintext[offset..end]) {
                 Ok(ct) => ct,
                 Err(_) => {
-                    st.phase = FdPhase::Failed;
+                    st.fail_closed();
                     set_errno(libc::EIO);
                     return -1;
                 }
             },
             _ => {
-                st.phase = FdPhase::Failed;
+                st.fail_closed();
                 set_errno(libc::EPIPE);
                 return -1;
             }
@@ -532,14 +547,14 @@ unsafe fn overlay_send(fd: c_int, plaintext: &[u8], flags: c_int) -> ssize_t {
         let mut f = match frame(suite_id, TYPE_DATA, &ct) {
             Ok(f) => f,
             Err(()) => {
-                st.phase = FdPhase::Failed;
+                st.fail_closed();
                 set_errno(libc::EMSGSIZE);
                 return -1;
             }
         };
         if let Err(e) = append_or_flush(fd, st, &f, flags, blocking) {
             f.zeroize();
-            st.phase = FdPhase::Failed;
+            st.fail_closed();
             set_errno(e);
             return -1;
         }
@@ -555,14 +570,14 @@ unsafe fn overlay_send(fd: c_int, plaintext: &[u8], flags: c_int) -> ssize_t {
                 Ok(true) => break plaintext.len() as ssize_t,
                 Ok(false) => continue,
                 Err(()) => {
-                    st.phase = FdPhase::Failed;
+                    st.fail_closed();
                     set_errno(libc::EIO);
                     break -1;
                 }
             }
         },
         Err(()) => {
-            st.phase = FdPhase::Failed;
+            st.fail_closed();
             set_errno(libc::EIO);
             -1
         }
@@ -628,7 +643,7 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
                 match try_pop_frame(&mut st.rx_wire) {
                     Ok(Some(f)) if f.tag == TYPE_DATA => {
                         if f.suite_id != st.policy_suite.id() {
-                            st.phase = FdPhase::Failed;
+                            st.fail_closed();
                             set_errno(libc::EPIPE);
                             return -1;
                         }
@@ -637,14 +652,14 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
                                 Ok(mut pt) => {
                                     if st.append_rx_plain(&pt).is_err() {
                                         pt.zeroize();
-                                        st.phase = FdPhase::Failed;
+                                        st.fail_closed();
                                         set_errno(libc::EPIPE);
                                         return -1;
                                     }
                                     pt.zeroize();
                                 }
                                 Err(_) => {
-                                    st.phase = FdPhase::Failed;
+                                    st.fail_closed();
                                     set_errno(libc::EPIPE);
                                     return -1;
                                 }
@@ -652,13 +667,13 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
                         }
                     }
                     Ok(Some(_)) => {
-                        st.phase = FdPhase::Failed;
+                        st.fail_closed();
                         set_errno(libc::EPIPE);
                         return -1;
                     }
                     Ok(None) => break,
                     Err(()) => {
-                        st.phase = FdPhase::Failed;
+                        st.fail_closed();
                         set_errno(libc::EPIPE);
                         return -1;
                     }
@@ -683,7 +698,7 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
                 return -1;
             }
             Err(()) => {
-                st.phase = FdPhase::Failed;
+                st.fail_closed();
                 set_errno(libc::EPIPE);
                 return -1;
             }
@@ -695,7 +710,7 @@ fn inherited_after_fork(st: &mut FdState) -> bool {
     if st.owner_pid == current_pid() {
         return false;
     }
-    st.phase = FdPhase::Failed;
+    st.fail_closed();
     true
 }
 
@@ -818,6 +833,9 @@ pub unsafe extern "C" fn connect(
     addrlen: libc::socklen_t,
 ) -> c_int {
     ffi_guard_c_int(|| {
+        if !interposition_enabled() {
+            return (real().connect)(fd, addr, addrlen);
+        }
         let res = (real().connect)(fd, addr, addrlen);
         let saved_errno = if res < 0 { errno() } else { 0 };
         if res == 0 || (res < 0 && saved_errno == libc::EINPROGRESS) {
@@ -837,6 +855,9 @@ pub unsafe extern "C" fn connect(
 /// `buf` must be valid for `len` bytes under the normal libc `send` contract.
 pub unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().send)(fd, buf, len, flags);
+        }
         if !ensure_tracked(fd) {
             return (real().send)(fd, buf, len, flags);
         }
@@ -867,6 +888,9 @@ pub unsafe extern "C" fn sendto(
     addrlen: libc::socklen_t,
 ) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().sendto)(fd, buf, len, flags, addr, addrlen);
+        }
         if block_stream_egress(fd) {
             return -1;
         }
@@ -882,6 +906,9 @@ pub unsafe extern "C" fn sendto(
 /// contract.
 pub unsafe extern "C" fn recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().recv)(fd, buf, len, flags);
+        }
         if !ensure_tracked(fd) {
             return (real().recv)(fd, buf, len, flags);
         }
@@ -896,6 +923,9 @@ pub unsafe extern "C" fn recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c
 /// `buf` must be valid for `len` bytes under the normal libc `write` contract.
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, len: size_t) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().write)(fd, buf, len);
+        }
         if !ensure_tracked(fd) {
             return (real().write)(fd, buf, len);
         }
@@ -918,6 +948,9 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, len: size_t) -> ss
 /// contract.
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().read)(fd, buf, len);
+        }
         if !ensure_tracked(fd) {
             return (real().read)(fd, buf, len);
         }
@@ -933,6 +966,9 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize
 /// `writev` contract.
 pub unsafe extern "C" fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().writev)(fd, iov, iovcnt);
+        }
         if iovcnt < 0 {
             set_errno(libc::EINVAL);
             return -1;
@@ -952,6 +988,9 @@ pub unsafe extern "C" fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> 
 /// libc `readv` contract.
 pub unsafe extern "C" fn readv(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().readv)(fd, iov, iovcnt);
+        }
         if iovcnt < 0 {
             set_errno(libc::EINVAL);
             return -1;
@@ -971,6 +1010,9 @@ pub unsafe extern "C" fn readv(fd: c_int, iov: *const iovec, iovcnt: c_int) -> s
 /// normal libc `sendmsg` contract.
 pub unsafe extern "C" fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().sendmsg)(fd, msg, flags);
+        }
         if msg.is_null() {
             set_errno(libc::EFAULT);
             return -1;
@@ -1003,6 +1045,9 @@ pub unsafe extern "C" fn sendmmsg(
     flags: c_int,
 ) -> c_int {
     ffi_guard_c_int(|| {
+        if !interposition_enabled() {
+            return (real().sendmmsg)(fd, msgvec, vlen, flags);
+        }
         if block_stream_egress(fd) {
             return -1;
         }
@@ -1018,6 +1063,9 @@ pub unsafe extern "C" fn sendmmsg(
 /// satisfy the normal libc `recvmsg` contract.
 pub unsafe extern "C" fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().recvmsg)(fd, msg, flags);
+        }
         if msg.is_null() {
             set_errno(libc::EFAULT);
             return -1;
@@ -1052,6 +1100,9 @@ pub unsafe extern "C" fn sendfile(
     count: size_t,
 ) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().sendfile)(out_fd, in_fd, offset, count);
+        }
         if block_stream_egress(out_fd) {
             return -1;
         }
@@ -1073,6 +1124,9 @@ pub unsafe extern "C" fn sendfile64(
     count: size_t,
 ) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().sendfile64)(out_fd, in_fd, offset, count);
+        }
         if block_stream_egress(out_fd) {
             return -1;
         }
@@ -1096,6 +1150,9 @@ pub unsafe extern "C" fn splice(
     flags: c_uint,
 ) -> ssize_t {
     ffi_guard_ssize(|| {
+        if !interposition_enabled() {
+            return (real().splice)(fd_in, off_in, fd_out, off_out, len, flags);
+        }
         if block_stream_egress(fd_in) || block_stream_egress(fd_out) {
             return -1;
         }
@@ -1110,6 +1167,9 @@ pub unsafe extern "C" fn splice(
 /// `fd` must follow the normal libc `close` contract.
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
     ffi_guard_c_int(|| {
+        if !interposition_enabled() {
+            return (real().close)(fd);
+        }
         // Global lock only: remove the map entry and drop the registry's `Arc`.
         // If another thread holds a cloned `Arc` and is mid-I/O on this fd, its clone
         // keeps the `FdState` (and its zeroizing `Drop`) alive until it finishes --

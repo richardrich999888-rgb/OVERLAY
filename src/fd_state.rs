@@ -9,6 +9,7 @@ use crate::crypto;
 use crate::crypto::{CipherSuite, InitiatorState, SessionKeys};
 use libc::c_int;
 use once_cell::sync::Lazy;
+use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::io;
@@ -20,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
+use std::time::Instant;
 use zeroize::Zeroize;
 
 pub const MAX_WIRE_RX_BUFFER: usize = 16 * 1024 * 1024;
@@ -35,6 +37,64 @@ const POLICY_FILE: &str = "policy.toml";
 const CONFIG_RELOAD_RETRY: Duration = Duration::from_secs(5);
 
 static CONFIG_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+struct RuntimeMetrics {
+    registry: Registry,
+    active_sessions: IntGauge,
+    handshake_latency: Histogram,
+    blocked_bypass_attempts: IntCounter,
+    config_epoch_reloads: IntCounter,
+}
+
+static RUNTIME_METRICS: Lazy<RuntimeMetrics> = Lazy::new(|| {
+    let registry = Registry::new();
+    let active_sessions = IntGauge::new(
+        "syntriass_active_sessions_total",
+        "Active authenticated Syntriass tunnels currently tracked.",
+    )
+    .expect("static Prometheus gauge definition is valid");
+    let handshake_latency = Histogram::with_opts(
+        HistogramOpts::new(
+            "syntriass_handshake_latency_seconds",
+            "Authenticated X25519 plus ML-KEM handshake latency in seconds.",
+        )
+        .buckets(vec![
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+        ]),
+    )
+    .expect("static Prometheus histogram definition is valid");
+    let blocked_bypass_attempts = IntCounter::new(
+        "syntriass_blocked_bypass_attempts_total",
+        "Fail-closed bypass attempts through unsupported stream-socket syscalls.",
+    )
+    .expect("static Prometheus counter definition is valid");
+    let config_epoch_reloads = IntCounter::new(
+        "syntriass_config_epoch_reloads_total",
+        "Successful cryptographic configuration epoch reloads.",
+    )
+    .expect("static Prometheus counter definition is valid");
+
+    registry
+        .register(Box::new(active_sessions.clone()))
+        .expect("active sessions metric registration is unique");
+    registry
+        .register(Box::new(handshake_latency.clone()))
+        .expect("handshake latency metric registration is unique");
+    registry
+        .register(Box::new(blocked_bypass_attempts.clone()))
+        .expect("blocked bypass metric registration is unique");
+    registry
+        .register(Box::new(config_epoch_reloads.clone()))
+        .expect("config reload metric registration is unique");
+
+    RuntimeMetrics {
+        registry,
+        active_sessions,
+        handshake_latency,
+        blocked_bypass_attempts,
+        config_epoch_reloads,
+    }
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferError {
@@ -71,6 +131,8 @@ pub struct FdState {
     pub rx_wire: Vec<u8>,
     /// Decrypted plaintext ready to hand back to the application.
     pub rx_plain: Vec<u8>,
+    handshake_started: Option<Instant>,
+    counted_active: bool,
 }
 
 impl FdState {
@@ -83,6 +145,8 @@ impl FdState {
             tx_backlog: Vec::new(),
             rx_wire: Vec::new(),
             rx_plain: Vec::new(),
+            handshake_started: Some(Instant::now()),
+            counted_active: false,
         }
     }
 
@@ -99,6 +163,8 @@ impl FdState {
             tx_backlog: client_hello_frame,
             rx_wire: Vec::new(),
             rx_plain: Vec::new(),
+            handshake_started: Some(Instant::now()),
+            counted_active: false,
         }
     }
 
@@ -111,6 +177,8 @@ impl FdState {
             tx_backlog: Vec::new(),
             rx_wire: Vec::new(),
             rx_plain: Vec::new(),
+            handshake_started: None,
+            counted_active: false,
         }
     }
 
@@ -127,6 +195,10 @@ impl FdState {
     }
 
     pub fn fail_closed(&mut self) {
+        if self.counted_active {
+            RUNTIME_METRICS.active_sessions.dec();
+            self.counted_active = false;
+        }
         self.tx_backlog.zeroize();
         self.rx_wire.zeroize();
         self.rx_plain.zeroize();
@@ -134,6 +206,19 @@ impl FdState {
         self.rx_wire.clear();
         self.rx_plain.clear();
         self.phase = FdPhase::Failed;
+    }
+
+    pub fn activate(&mut self, keys: SessionKeys) {
+        if !self.counted_active {
+            RUNTIME_METRICS.active_sessions.inc();
+            self.counted_active = true;
+        }
+        if let Some(started) = self.handshake_started.take() {
+            RUNTIME_METRICS
+                .handshake_latency
+                .observe(started.elapsed().as_secs_f64());
+        }
+        self.phase = FdPhase::Active(keys);
     }
 
     pub fn fail_if_stale_idle_config(&mut self) -> bool {
@@ -161,6 +246,22 @@ pub fn current_config_epoch() -> u64 {
     CONFIG_EPOCH.load(Ordering::Acquire)
 }
 
+pub fn record_blocked_bypass_attempt() {
+    RUNTIME_METRICS.blocked_bypass_attempts.inc();
+}
+
+pub fn record_config_epoch_reload() {
+    RUNTIME_METRICS.config_epoch_reloads.inc();
+}
+
+pub fn render_prometheus_metrics() -> Result<String, prometheus::Error> {
+    let metrics = RUNTIME_METRICS.registry.gather();
+    let encoder = TextEncoder::new();
+    let mut output = Vec::new();
+    encoder.encode(&metrics, &mut output)?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
+
 #[cfg(target_os = "linux")]
 fn advance_config_epoch() -> u64 {
     CONFIG_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
@@ -168,6 +269,10 @@ fn advance_config_epoch() -> u64 {
 
 impl Drop for FdState {
     fn drop(&mut self) {
+        if self.counted_active {
+            RUNTIME_METRICS.active_sessions.dec();
+            self.counted_active = false;
+        }
         self.tx_backlog.zeroize();
         self.rx_wire.zeroize();
         self.rx_plain.zeroize();
@@ -239,6 +344,7 @@ fn handle_config_change() {
     match crypto::reload_runtime_config() {
         Ok(()) => {
             let epoch = advance_config_epoch();
+            record_config_epoch_reload();
             retire_idle_sessions_for_new_config(epoch);
             eprintln!("syntriass: reloaded cryptographic config epoch {epoch}");
         }

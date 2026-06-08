@@ -1,9 +1,16 @@
-use axum::{extract::Json, http::StatusCode, routing::post, Router};
+use axum::{
+    extract::Json,
+    http::{header, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+    Router,
+};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
 use std::net::SocketAddr;
+use syntriass_overlay::fd_state;
 
 const VOLUME_NAME: &str = "syntriass-overlay";
 const INIT_CONTAINER_NAME: &str = "syntriass-binary-copier";
@@ -75,10 +82,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bind_addr = env::var("SYNTRIASS_WEBHOOK_BIND")
         .unwrap_or_else(|_| "0.0.0.0:8443".to_string())
         .parse::<SocketAddr>()?;
-    let app = Router::new().route("/mutate", post(mutate));
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
+    let metrics_addr = env::var("SYNTRIASS_METRICS_BIND")
+        .unwrap_or_else(|_| "0.0.0.0:9090".to_string())
+        .parse::<SocketAddr>()?;
+    let webhook_app = Router::new().route("/mutate", post(mutate));
+    let metrics_app = Router::new().route("/metrics", get(metrics));
+    let webhook_listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+    tokio::try_join!(
+        axum::serve(webhook_listener, webhook_app),
+        axum::serve(metrics_listener, metrics_app)
+    )?;
     Ok(())
+}
+
+async fn metrics() -> impl IntoResponse {
+    match fd_state::render_prometheus_metrics() {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, prometheus::TEXT_FORMAT)],
+            body,
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "metrics unavailable\n".to_string(),
+        ),
+    }
 }
 
 async fn mutate(Json(review): Json<AdmissionReview>) -> (StatusCode, Json<AdmissionReview>) {

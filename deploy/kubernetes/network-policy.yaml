@@ -1,0 +1,80 @@
+---
+# Native Kubernetes NetworkPolicy is namespaced. Apply this manifest into each
+# namespace labeled `syntriass-injection=enabled`. The peer selectors below keep
+# each Syntriass policy identifier isolated from every other policy identifier.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: syntriass-default-deny
+  labels:
+    app.kubernetes.io/name: syntriass-overlay
+    app.kubernetes.io/component: zero-trust-network-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: syntriass-allow-nist768-peers
+  labels:
+    app.kubernetes.io/name: syntriass-overlay
+    app.kubernetes.io/component: zero-trust-network-policy
+    syntriass.io/policy-id: nist768
+spec:
+  podSelector:
+    matchLabels:
+      syntriass.io/policy-id: nist768
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              syntriass-injection: enabled
+          podSelector:
+            matchLabels:
+              syntriass.io/policy-id: nist768
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              syntriass-injection: enabled
+          podSelector:
+            matchLabels:
+              syntriass.io/policy-id: nist768
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: syntriass-allow-nist1024-peers
+  labels:
+    app.kubernetes.io/name: syntriass-overlay
+    app.kubernetes.io/component: zero-trust-network-policy
+    syntriass.io/policy-id: nist1024
+spec:
+  podSelector:
+    matchLabels:
+      syntriass.io/policy-id: nist1024
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              syntriass-injection: enabled
+          podSelector:
+            matchLabels:
+              syntriass.io/policy-id: nist1024
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              syntriass-injection: enabled
+          podSelector:
+            matchLabels:
+              syntriass.io/policy-id: nist1024
