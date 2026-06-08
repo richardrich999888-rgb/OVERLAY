@@ -104,6 +104,36 @@ impl From<KtlsError> for KernelNativeError {
     }
 }
 
+/// Availability posture when the control plane's status changes.
+///
+/// This is the confidentiality-preserving replacement for a "Kinetic" plaintext
+/// bypass. There is deliberately **no `Plaintext` variant**: cleartext egress is
+/// unrepresentable, so no code path — and no future edit — can route mission
+/// traffic in the clear. Availability under a daemon outage / EW jamming is
+/// preserved by an *encrypted* PSK fallback, or else by dropping the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvailabilityPosture {
+    /// Control plane healthy: full hybrid PQC handshake (forward secret).
+    FullPqc,
+    /// Control plane down but a fallback PSK is configured: quantum-safe
+    /// AES-256-GCM under the PSK. Encrypted, authenticated, no forward secrecy.
+    EncryptedFallback,
+    /// Control plane down and no PSK: drop the connection. Never plaintext.
+    FailClosed,
+}
+
+/// Choose the posture from control-plane availability and PSK configuration.
+/// `daemon_available` is whatever liveness signal the v2 control plane uses
+/// (heartbeat, socket reachability); `psk_configured` is `resolve_fallback_psk`
+/// having returned a key.
+pub fn select_posture(daemon_available: bool, psk_configured: bool) -> AvailabilityPosture {
+    match (daemon_available, psk_configured) {
+        (true, _) => AvailabilityPosture::FullPqc,
+        (false, true) => AvailabilityPosture::EncryptedFallback,
+        (false, false) => AvailabilityPosture::FailClosed,
+    }
+}
+
 pub fn classify_upcall(upcall: &KernelUpcall) -> EnforcementDecision {
     if upcall.local_port == 0 || upcall.remote_port == 0 {
         EnforcementDecision::Ignore

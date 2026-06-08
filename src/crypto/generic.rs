@@ -138,6 +138,33 @@ fn derive(
     Ok(keys)
 }
 
+/// Quantum-safe *degraded* fallback key schedule.
+///
+/// Derives an AES-256-GCM session purely from a pre-shared key plus a fresh
+/// client/server nonce pair — no asymmetric crypto at all. This is the
+/// confidentiality-preserving alternative to a plaintext bypass: when the full
+/// PQC control plane is unavailable, peers that share a PSK can still talk
+/// *encrypted* (AES-256 ⇒ 128-bit post-quantum security via Grover), and the PSK
+/// itself authenticates (an attacker without it derives a different key and AEAD
+/// open fails). The tradeoff vs. the full handshake is **no forward secrecy**
+/// (PSK reuse); that is the documented price of availability under jamming, and
+/// it never sends cleartext.
+pub(crate) fn derive_fallback(
+    psk: &[u8],
+    client_nonce: &[u8],
+    server_nonce: &[u8],
+    is_initiator: bool,
+) -> Result<SessionKeys, CryptoError> {
+    let mut h = Sha256::new();
+    h.update(b"syntriass-overlay psk-fallback transcript v1");
+    h.update(client_nonce);
+    h.update(server_nonce);
+    let th: [u8; 32] = h.finalize().into();
+    // 0xFF is reserved: `CipherSuite::from_id(0xFF)` is `None`, so fallback keys
+    // can never collide with a real suite's key schedule (domain separation).
+    derive(psk, 0xFF, &th, is_initiator)
+}
+
 /// Retained initiator secrets for a generic suite. Boxed behind `InitiatorState`.
 pub struct GenericInitiatorState<K: KemCore> {
     suite_id: u8,

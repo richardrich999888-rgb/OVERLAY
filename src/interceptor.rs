@@ -1211,3 +1211,67 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         (real().close)(fd)
     })
 }
+
+#[cfg(test)]
+mod crash_isolation_tests {
+    //! Fault-injection: prove an internal panic / lock-poison on the interposed
+    //! path is converted to a clean `-1`/`EIO` and the host process stays up,
+    //! instead of SIGABRT-ing it. Under `panic = "abort"` (the old release
+    //! profile) `catch_unwind` could not catch and the process aborted; the tests
+    //! run under the unwind profile that the cdylib now also uses.
+    use super::*;
+    use crate::crypto::CipherSuite;
+
+    fn silence_panics() {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
+
+    #[test]
+    fn ffi_guard_converts_panic_to_eio_without_crashing() {
+        silence_panics();
+        let rc = ffi_guard_ssize(|| panic!("simulated bug on interposed write path"));
+        assert_eq!(rc, -1, "guarded ssize panic must return -1");
+        unsafe { assert_eq!(errno(), libc::EIO, "errno must be EIO") };
+        let rc2 = ffi_guard_c_int(|| panic!("simulated bug on interposed connect path"));
+        assert_eq!(rc2, -1, "guarded c_int panic must return -1");
+        // Reaching this line at all proves the host (this process) survived.
+    }
+
+    #[test]
+    fn registry_lock_recovers_from_poison() {
+        // `lock_registry` works in the normal case...
+        {
+            let _g = lock_registry();
+        }
+        // ...and the recovery pattern it uses (`into_inner`) yields a usable
+        // guard even after poisoning. Demonstrated on a local mutex so we do not
+        // permanently poison the shared REGISTRY for sibling tests.
+        silence_panics();
+        let m = Mutex::new(0xABCDu32);
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _g = m.lock().unwrap();
+            panic!("poison");
+        }));
+        let g = match m.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        assert_eq!(*g, 0xABCD, "poison recovery must preserve the data");
+    }
+
+    #[test]
+    fn poisoned_fd_state_is_fail_closed_detectable() {
+        // A panic while holding a per-fd lock poisons it; the overlay_send/recv
+        // graceful path treats `state.lock()` == Err as fail-closed (returns EIO).
+        silence_panics();
+        let st = Arc::new(Mutex::new(FdState::failed(CipherSuite::NistStandard768)));
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _g = st.lock().unwrap();
+            panic!("poison per-fd state mid-mutation");
+        }));
+        assert!(
+            st.lock().is_err(),
+            "poisoned per-fd lock must be observable so I/O fails closed"
+        );
+    }
+}

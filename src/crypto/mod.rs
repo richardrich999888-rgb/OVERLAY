@@ -43,6 +43,10 @@ pub const ED25519_SEED_LEN: usize = SECRET_KEY_LENGTH;
 pub const IDENTITY_PUBLIC_LEN: usize = ED25519_PUBLIC_LEN + MLDSA65_PUBLIC_LEN;
 pub const IDENTITY_SIGNATURE_LEN: usize = ED25519_SIGNATURE_LEN + MLDSA65_SIGNATURE_LEN;
 
+/// Degraded-fallback pre-shared key + nonce sizes (quantum-safe symmetric path).
+pub const FALLBACK_PSK_LEN: usize = 32;
+pub const FALLBACK_NONCE_LEN: usize = 16;
+
 /// Errors that never panic the host process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
@@ -390,6 +394,28 @@ pub fn resolve_identity() -> Result<Arc<IdentityMaterial>, CryptoError> {
         Ok(identity) => Ok(Arc::clone(identity)),
         Err(e) => Err(*e),
     }
+}
+
+/// Derive a quantum-safe degraded-fallback session from a pre-shared key and a
+/// fresh nonce pair. Used only when the full PQC path is unavailable; it keeps
+/// traffic **encrypted** (never plaintext) at the cost of forward secrecy. Both
+/// peers must share the PSK and agree on the same nonces (initiator/responder
+/// roles mirror the key directions, as in the PQC path).
+pub fn derive_fallback_session(
+    psk: &[u8; FALLBACK_PSK_LEN],
+    client_nonce: &[u8; FALLBACK_NONCE_LEN],
+    server_nonce: &[u8; FALLBACK_NONCE_LEN],
+    is_initiator: bool,
+) -> Result<SessionKeys, CryptoError> {
+    generic::derive_fallback(psk, client_nonce, server_nonce, is_initiator)
+}
+
+/// Load the optional degraded-fallback PSK from `SYNTRIASS_FALLBACK_PSK_HEX`
+/// (64 hex chars = 32 bytes). Returns `None` when unset or malformed — the
+/// caller then has no fallback and must fail closed (never plaintext).
+pub fn resolve_fallback_psk() -> Option<[u8; FALLBACK_PSK_LEN]> {
+    let token = std::env::var("SYNTRIASS_FALLBACK_PSK_HEX").ok()?;
+    decode_hex_exact::<FALLBACK_PSK_LEN>(&token).ok()
 }
 
 fn read_identity_config_from_sources() -> Result<CachedIdentityConfig, CryptoError> {
