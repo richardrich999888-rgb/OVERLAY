@@ -1,119 +1,435 @@
-# syntriass-overlay
+# Syntriass Overlay
 
-A **Linux-only** `LD_PRELOAD` runtime layer that transparently wraps a POSIX
-stream socket in an **authenticated, runtime-agile hybrid post-quantum tunnel**
-(X25519 + ML-KEM, Ed25519 + ML-DSA-65 identity signatures, HKDF-SHA256 schedule,
-AES-256-GCM records) **without modifying the application**.
+Syntriass Overlay is a defence-oriented runtime encryption layer for protecting
+legacy TCP applications in controlled Linux/glibc environments. It uses
+`LD_PRELOAD` libc interposition to wrap ordinary POSIX stream-socket traffic in
+an authenticated hybrid post-quantum tunnel without requiring changes to the
+application binary.
 
-## Cipher agility (this revision)
+The product is built for defensive network protection: reduce plaintext exposure
+on internal links, harden legacy services that cannot be modified quickly, and
+fail closed when identity, policy, framing, or cryptographic verification does
+not match the configured trust policy.
 
-The active suite is **late-bound** at process start and pinned for the process:
+## Product Description
 
-- `SYNTRIASS_SUITE` env var (e.g. `SYNTRIASS_SUITE=0x02`), else
-- `/etc/syntriass/policy.toml` (`suite = "nist1024"`), else
-- safe default: `nist768`.
+Many operational systems still depend on applications that speak plaintext over
+TCP or rely on inconsistent transport security. Rewriting those applications is
+often slow, risky, or impossible. Syntriass Overlay provides a process-local
+security control that sits between the application and libc socket calls.
 
-Suites: `NistStandard768` (id `0x01`) and `NistStandard1024` (id `0x02`).
-**There is no legacy/no-PQC suite and no wire-negotiable downgrade.**
+From the application's perspective, it still calls `connect`, `send`, `recv`,
+`write`, `read`, `sendmsg`, or related APIs. From the network's perspective,
+the bytes are Syntriass overlay frames carrying authenticated encrypted records.
 
-## Mandatory peer authentication
+Syntriass is intended for deployments where both peers are controlled, identity
+material can be provisioned out of band, and the operator wants a strict
+fail-closed runtime layer rather than a permissive best-effort shim.
 
-Every handshake is signed by both peers with long-term identity keys:
+## Defence Use Cases
 
-- Ed25519 for classical identity authentication
-- ML-DSA-65 for post-quantum identity authentication
+- Protect legacy TCP services in enclaves, labs, test ranges, or private
+  operational networks.
+- Add wire opacity to applications that cannot be immediately upgraded to a
+  native secure transport.
+- Enforce peer identity at process startup using pre-distributed public keys.
+- Detect and reject tampered handshakes, unauthenticated clients, and malformed
+  records before application plaintext is delivered.
+- Block common plaintext bypass paths such as `sendto`, `sendfile`, and
+  `splice` on protected stream sockets.
 
-Each process must be configured with its own signing seeds and the exact peer
-public keys it trusts, either through environment variables or
-`/etc/syntriass/identity.toml`. Missing or malformed identity material fails
-closed; the overlay does not run anonymously.
+This is a defensive runtime control. It is not an exploit framework, scanner,
+traffic injector, or offensive tool.
+
+## Technical Architecture
+
+Syntriass Overlay builds a `cdylib` shared object:
+
+```text
+target/release/libsyntriass_overlay.so
+```
+
+That object is loaded into a target process with `LD_PRELOAD`. It resolves the
+real libc symbols through `dlsym(RTLD_NEXT, ...)`, then interposes selected
+socket and file-descriptor functions.
+
+The core runtime components are:
+
+```text
+src/crypto/        hybrid handshake, identity authentication, AEAD records
+src/fd_state.rs    per-fd state machine, bounded buffers, global registry
+src/interceptor.rs libc hook implementations and fail-closed I/O paths
+```
+
+Each tracked file descriptor has an `FdState`:
+
+```text
+InitiatorAwaitingServerHello
+ResponderAwaitingClientHello
+Active(SessionKeys)
+Failed
+```
+
+Once a descriptor reaches `Active`, application plaintext is sealed into
+AES-256-GCM records before real socket transmission. Incoming records are
+reassembled from the byte stream, authenticated, decrypted, and returned to the
+application as ordinary plaintext reads.
+
+## Cryptographic Construction
+
+Each protected session uses an authenticated hybrid key exchange:
+
+- X25519 ephemeral Diffie-Hellman
+- ML-KEM-768 for suite `0x01`, or ML-KEM-1024 for suite `0x02`
+- Ed25519 long-term identity signatures
+- ML-DSA-65 long-term identity signatures
+- HKDF-SHA256 directional session-key derivation
+- AES-256-GCM record encryption and authentication
+
+The design combines classical and post-quantum mechanisms for both key
+agreement and peer authentication. The handshake is not anonymous: both peers
+must be provisioned with local signing seeds and the exact public keys of the
+peer they trust.
+
+## Peer Authentication
+
+Both `ClientHello` and `ServerHello` are signed. The responder validates the
+initiator's identity before accepting the handshake. The initiator validates the
+responder's identity before deriving usable application traffic keys.
+
+Identity uses two signature systems:
+
+```text
+Ed25519     classical identity signature
+ML-DSA-65   post-quantum identity signature
+```
+
+Missing identity material, malformed keys, unknown peer keys, bad signatures, or
+tampered transcripts transition the descriptor to `FdPhase::Failed`. Application
+plaintext is not delivered on failed sessions.
+
+## Suite Policy
+
+The active cipher suite is resolved once per process and pinned:
+
+1. `SYNTRIASS_SUITE`, if set
+2. `/etc/syntriass/policy.toml`, if present
+3. Default: `nist768`
+
+Supported values:
+
+| Policy token | Suite ID | KEM |
+| --- | --- | --- |
+| `nist768`, `768`, `0x01` | `0x01` | ML-KEM-768 |
+| `nist1024`, `1024`, `0x02` | `0x02` | ML-KEM-1024 |
+
+There is no legacy plaintext suite, no anonymous suite, and no wire-negotiable
+downgrade. If the initiator and responder policies do not match, the session
+fails closed.
+
+Example:
+
+```toml
+suite = "nist768"
+```
+
+## Identity Provisioning
 
 Environment variables:
 
-- `SYNTRIASS_ED25519_SEED_HEX`
-- `SYNTRIASS_MLDSA65_SEED_HEX`
-- `SYNTRIASS_PEER_ED25519_PUB_HEX`
-- `SYNTRIASS_PEER_MLDSA65_PUB_HEX`
+```text
+SYNTRIASS_ED25519_SEED_HEX
+SYNTRIASS_MLDSA65_SEED_HEX
+SYNTRIASS_PEER_ED25519_PUB_HEX
+SYNTRIASS_PEER_MLDSA65_PUB_HEX
+```
 
-The `syntriass-identity` helper derives public keys from local seeds:
+Equivalent file configuration:
+
+```toml
+ed25519_seed = "<32-byte seed as 64 hex characters>"
+mldsa65_seed = "<32-byte seed as 64 hex characters>"
+peer_ed25519_public = "<32-byte public key as 64 hex characters>"
+peer_mldsa65_public = "<1952-byte public key as 3904 hex characters>"
+```
+
+The file path is:
+
+```text
+/etc/syntriass/identity.toml
+```
+
+The helper binary derives public keys from local seeds:
 
 ```bash
-cargo run --release --bin syntriass-identity -- <ed25519-seed-hex> <mldsa65-seed-hex>
+cargo run --release --bin syntriass-identity -- \
+  <ed25519-seed-hex> <mldsa65-seed-hex>
 ```
 
-### Negotiation = fail closed
-The initiator proposes its policy suite in the ClientHello. The responder accepts
-**only if** the proposed suite equals its own policy suite; otherwise it drops the
-session. No silent downgrade (avoids the FREAK/Logjam class).
+## Runtime Data Flow
 
-### Transcript binding
-The negotiated `suite_id` is folded into the HKDF `info`, and also travels in the
-clear in each frame header. A MITM that flips the suite byte produces a different
-key schedule on the tampered side -> AEAD authentication fails -> session dropped.
+Outbound flow:
 
-## Frame format (single, unambiguous)
-
-```
-u32 big-endian   LENGTH of (suite_id + type + payload)
-u8               SUITE_ID  (0x01=NIST-768, 0x02=NIST-1024)
-u8               TYPE      (1=ClientHello, 2=ServerHello, 3=Data)
-[u8]             PAYLOAD
+```text
+application plaintext
+  -> intercepted send/write/sendmsg path
+  -> fd registry lookup or stream-socket adoption
+  -> authenticated handshake if not active
+  -> SessionKeys::seal()
+  -> Syntriass frame
+  -> real libc send()
+  -> network
 ```
 
-## Layout
+Inbound flow:
 
-```
-syntriass-overlay/
-├── Cargo.toml
-├── policy.toml.example
-├── identity.toml.example
-├── src/
-│   ├── bin/
-│   │   └── syntriass-identity.rs
-│   ├── lib.rs              # crate root
-│   ├── crypto/
-│   │   ├── mod.rs          # trait, CipherSuite, policy reader, SessionKeys, tests
-│   │   ├── generic.rs      # shared X25519+ML-KEM core (generic over KemCore) + tests
-│   │   ├── nist768.rs      # suite 0x01
-│   │   └── nist1024.rs     # suite 0x02
-│   ├── fd_state.rs         # per-fd state machine, bounded buffers + registry
-│   └── interceptor.rs      # connect/send/recv/read/write/readv/writev/sendmsg/recvmsg hooks
-└── tests/
-    ├── vulnerable_app.py
-    └── verify_wire.py
+```text
+network
+  -> real libc recv()
+  -> wire buffer
+  -> frame reassembly
+  -> suite/type validation
+  -> SessionKeys::open()
+  -> plaintext buffer
+  -> application recv/read/recvmsg result
 ```
 
-## Honest status
+If any required step fails, the fd state becomes `Failed` and later operations
+return an error rather than falling back to plaintext.
 
-- The crate is Linux/glibc-oriented. Unit tests compile on macOS for development,
-  but the production shared object must be validated in a Linux/glibc runtime.
-- **Known compile-risk points:** the two `try_from` conversions in
-  `src/crypto/generic.rs` (encapsulation key and ciphertext). If the compiler
-  reports an unsatisfied `TryFrom<&[u8]>` bound (RustCrypto/hybrid-array#114), the
-  inline comments give the one-line fix (`ml_kem::array::Array::try_from`).
-- `ml-kem` is itself **unaudited** (upstream says so). PoC only. Not "mathematically
-  proven safe" — only the API shapes were verified against docs.rs.
-- `connect`, `send`, `recv`, `write`, `read`, `writev`, `readv`, `sendmsg`,
-  `recvmsg`, and `close` are hooked. Applications using unrelated syscalls or
-  direct kernel interfaces outside libc interposition are out of scope.
+## Interposed APIs
 
-## Build & test (Linux, or in a container on Apple Silicon)
+Encrypted stream pipeline:
 
-```bash
-docker run --rm -it -v "$PWD":/w -w /w/syntriass-overlay \
-  rust:1.85-slim-bookworm bash -lc '
-    apt-get update && apt-get install -y python3 build-essential &&
-    cargo test --release &&            # crypto agility + MITM + policy tests (no sockets)
-    cargo build --release &&           # -> target/release/libsyntriass_overlay.so
-    python3 tests/verify_wire.py       # end-to-end wire proof
-  '
+```text
+connect
+send
+recv
+write
+read
+writev
+readv
+sendmsg
+recvmsg
+close
 ```
+
+Fail-closed alternate egress paths:
+
+```text
+sendto
+sendmmsg
+sendfile
+sendfile64
+splice
+```
+
+For stream sockets, these alternate egress calls return `EOPNOTSUPP` because
+their native semantics cannot safely preserve overlay framing and encryption.
+For non-stream descriptors, they pass through to libc.
+
+## Fail-Closed Controls
+
+Syntriass is designed to prefer connection failure over plaintext leakage.
+
+Implemented fail-closed controls include:
+
+- Missing or malformed suite policy fails closed.
+- Missing or malformed identity material fails closed.
+- Untrusted peer identity fails closed.
+- Bad Ed25519 or ML-DSA-65 signatures fail closed.
+- Cross-suite mismatch fails closed.
+- Tampered records fail AEAD verification and fail closed.
+- Oversized or invalid frame lengths fail closed.
+- Bounded receive and write buffers limit memory-exhaustion exposure.
+- Unsupported egress syscalls on stream sockets fail closed.
+- Fork-inherited active sessions fail closed before record sealing.
+
+## Fork-After-Connect Protection
+
+AES-GCM safety depends on never reusing a key and nonce pair. A process that
+forks after establishing a connection can inherit active session keys and record
+counters. If the child writes on the inherited fd, it can otherwise reuse a
+counter value already used by the parent.
+
+Syntriass records the owner PID in each `FdState`. On every overlay send and
+receive operation, the current PID is checked under the per-fd lock before
+handshake progress, `seal()`, `open()`, or frame emission.
+
+If the current PID differs from the owner PID:
+
+```text
+phase -> FdPhase::Failed
+errno -> EPIPE
+return -> -1
+```
+
+Transitioning to `Failed` drops active `SessionKeys`, and sensitive key material
+is zeroized through the crate's zeroization paths. The parent process keeps its
+own fd state and can continue using the connection.
+
+## Frame Format
+
+```text
+u32 big-endian   body length
+u8               suite_id
+u8               type
+[u8]             payload
+```
+
+Frame types:
+
+```text
+1  ClientHello
+2  ServerHello
+3  Data
+```
+
+The cleartext header identifies the suite and frame type. Data payloads are
+AEAD-protected. Handshake transcript material and suite identity are bound into
+the authentication and key schedule so tampering causes verification failure.
+
+## Memory Safety and Key Handling
+
+The release profile uses:
+
+```toml
+panic = "abort"
+```
+
+This avoids unwinding across FFI boundaries. Sensitive buffers and key material
+use explicit zeroization where the crate owns those bytes, including session key
+drop paths and mutable plaintext/wire buffers.
+
+Stream reassembly buffers are bounded to reduce denial-of-service risk from
+fragmented or malicious inputs.
+
+## Build
 
 Native Linux:
 
 ```bash
-cd syntriass-overlay
-cargo test --release
 cargo build --release
-SYNTRIASS_SUITE=0x02 python3 tests/verify_wire.py   # exercise the 1024 suite
 ```
+
+Run unit tests:
+
+```bash
+cargo test --release
+```
+
+The production shared object is:
+
+```text
+target/release/libsyntriass_overlay.so
+```
+
+## Container Build on Apple Silicon
+
+Use a Linux/glibc container to validate the preload behavior:
+
+```bash
+docker run --rm -t -v "$PWD":/w -w /w rust:1.85-slim-bookworm bash -lc '
+  export PATH=/usr/local/cargo/bin:$PATH
+  apt-get update >/dev/null
+  apt-get install -y python3 build-essential binutils >/dev/null
+  cargo build --release
+  cargo test --release
+  python3 tests/verify_wire.py
+  SYNTRIASS_SUITE=0x02 python3 tests/verify_wire.py
+'
+```
+
+## Running a Protected Application
+
+Both endpoints need reciprocal identity configuration.
+
+```bash
+LD_PRELOAD="$PWD/target/release/libsyntriass_overlay.so" \
+SYNTRIASS_SUITE=0x01 \
+SYNTRIASS_ED25519_SEED_HEX=<local-ed25519-seed> \
+SYNTRIASS_MLDSA65_SEED_HEX=<local-mldsa65-seed> \
+SYNTRIASS_PEER_ED25519_PUB_HEX=<trusted-peer-ed25519-public> \
+SYNTRIASS_PEER_MLDSA65_PUB_HEX=<trusted-peer-mldsa65-public> \
+./your-legacy-program
+```
+
+## Verification Harness
+
+The test suite includes both cryptographic unit tests and Linux runtime tests.
+
+```bash
+cargo test --release
+python3 tests/verify_wire.py
+SYNTRIASS_SUITE=0x02 python3 tests/verify_wire.py
+python3 tests/failclosed_test.py
+python3 tests/concurrency_test.py
+python3 tests/fork_test.py
+python3 tests/egress_test.py
+python3 tests/characterize.py
+```
+
+The runtime tests verify:
+
+- The baseline application leaks plaintext without the overlay.
+- The same application sees correct plaintext with the overlay loaded.
+- The relay captures nonzero overlay traffic.
+- The plaintext marker is absent from captured overlay traffic.
+- Tampered and unauthenticated connections fail closed.
+- Concurrent connections complete without global-lock deadlock.
+- A forked child contributes zero Data records on an inherited fd.
+- `sendto` and `sendfile` fail closed on tracked stream sockets.
+- Non-stream operations still pass through.
+
+## Repository Layout
+
+```text
+Cargo.toml
+policy.toml.example
+identity.toml.example
+
+src/
+  lib.rs
+  bin/syntriass-identity.rs
+  crypto/
+    mod.rs
+    generic.rs
+    nist768.rs
+    nist1024.rs
+  fd_state.rs
+  interceptor.rs
+
+tests/
+  vulnerable_app.py
+  verify_wire.py
+  failclosed_test.py
+  concurrency_test.py
+  fork_test.py
+  egress_test.py
+  netimpair_test.py
+  characterize.py
+```
+
+## Operational Boundaries
+
+- Production target: Linux/glibc.
+- macOS development can compile parts of the crate, but cannot validate Linux
+  preload semantics.
+- Static binaries, direct raw syscalls, custom runtimes, or non-libc network
+  paths may bypass libc interposition.
+- The product protects TCP stream sockets, not UDP or arbitrary IPC.
+- Identity provisioning is external and must be handled by the operator.
+- The RustCrypto `ml-kem` and `ml-dsa` crates are pinned; review upstream audit
+  status before production deployment.
+- This layer does not replace network segmentation, host hardening, endpoint
+  monitoring, or application-level authorization.
+- The fork PID guard closes inherited-session nonce reuse. It is not a general
+  solution for all multithreaded fork hazards in preload libraries.
+
+## Status
+
+Syntriass Overlay is a defensive runtime security product prototype with a
+strict fail-closed posture over its covered Linux/glibc socket surface. It is
+suitable for controlled evaluation and pilot environments where operators can
+provision peer identity material and validate the runtime harness on the target
+platform before deployment.
