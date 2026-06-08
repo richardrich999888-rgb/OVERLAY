@@ -34,7 +34,9 @@ jobs:
           apt-get install -yq python3 binutils
 
       - name: Formatting gate (cargo fmt --check)
-        run: cargo fmt --check
+        run: |
+          rustup component add rustfmt
+          cargo fmt --check
 
       - name: Clippy (advisory, non-blocking)
         # Intentionally NOT a hard gate. clippy's `unnecessary_cast` fires on
