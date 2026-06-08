@@ -147,6 +147,77 @@ level of existing TCP systems without waiting for a full application rewrite.
 | Government modernization programs | Bridge old systems into post-quantum migration plans | Hybrid classical plus post-quantum key exchange and identity authentication are introduced at the runtime layer |
 | Red/blue evaluation ranges | Prove whether a legacy application leaks data on the wire | Harnesses compare baseline plaintext leakage against protected overlay traffic |
 
+## Financial Arbitrage and Competitive Advantages
+
+The post-quantum transition is not only a cryptographic procurement problem. For
+legacy estates, the largest blockers are engineering labor, operational downtime,
+recertification risk, and the practical difficulty of changing systems that
+already run critical workflows. Syntriass is designed to reduce those transition
+costs by moving transport protection into a controlled process runtime layer.
+
+### Cost-Effectiveness: TCO Pressure Points
+
+The table below frames the cost categories operators should evaluate when
+comparing runtime overlay deployment against manual rewrites or network
+appliances. The actual financial values depend on fleet size, certification
+scope, deployment geography, and assurance requirements.
+
+| Expense category | Manual application refactoring | Hardware or network gateway approach | Syntriass runtime overlay |
+| --- | --- | --- | --- |
+| Engineering labor | Requires source-code changes, protocol redesign, regression testing, and application-owner coordination | Requires network design, routing changes, appliance integration, and operational handoff | Keeps the application binary unchanged and moves protection to launch policy and identity provisioning |
+| Downtime risk | High during staged migrations, cutovers, and rollback planning | Medium to high during routing, topology, or gateway maintenance windows | Lower for controlled pilots because protection is applied at process start with `LD_PRELOAD` |
+| Certification impact | Application changes may trigger new safety, banking, or defence review cycles | Appliance certification may not cover host-local or process-local plaintext exposure | The original application binary remains untouched; overlay assurance is evaluated separately |
+| Coverage boundary | Strong when fully implemented, but slow across large legacy estates | Strong at chokepoints, but blind to traffic that never crosses the gateway | Protects covered libc stream-socket operations inside the process and fails closed on known bypass syscalls |
+| Deployment footprint | No new hardware, but high engineering dependency | Requires appliance capacity, rack space, power, and network management | Software-only shared object plus policy and identity material |
+| Crypto-agility | Depends on every modified application adopting the new suite | Depends on gateway vendor lifecycle and topology | Suite selection is policy-pinned and can be changed without rewriting the protected application |
+
+The economic outcome is a smaller and more controlled migration surface:
+operators can protect selected high-value TCP workflows first, prove wire
+opacity with the verification harness, and then expand deployment as identity
+provisioning and operational compatibility are validated.
+
+### Exclusive Competitive Advantages
+
+Syntriass is not positioned as a generic VPN, packet appliance, or cloud scanner.
+Its advantage is process-local enforcement: the overlay sits where the legacy
+application touches libc, before plaintext leaves through covered stream-socket
+paths.
+
+#### Mixed-I/O Plaintext Leak Prevention
+
+Legacy applications frequently mix `send`, `write`, `writev`, `sendmsg`, and
+Linux shortcut paths such as `sendfile` or `splice`. A gateway can only protect
+bytes that reach it, and a partial shim can miss alternate file-descriptor
+operations.
+
+Syntriass routes covered read/write socket operations through the same
+cryptographic state machine and fails closed on unsupported egress syscalls when
+they target a tracked stream socket. That gives operators a concrete enforcement
+property: known mixed-I/O bypass attempts do not silently downgrade to plaintext.
+
+#### Fork-Aware Cryptographic Invariant Protection
+
+User-space runtime overlays must account for `fork()`. A child process can
+inherit active keys and counters from the parent, and a careless implementation
+could let both processes seal records under the same AEAD nonce sequence.
+
+Syntriass stamps file-descriptor state with the owning process ID and checks that
+owner before send or receive operations. If an inherited active session is used
+from the wrong process, the descriptor fails closed before additional records are
+sealed. This preserves the nonce uniqueness invariant that AES-GCM depends on.
+
+#### Sovereign and Disconnected Deployment Fit
+
+Some defence, banking, and critical-infrastructure environments cannot rely on a
+cloud control plane for core transport security. Syntriass is designed as a local
+Linux/glibc runtime component: it does not require telemetry, internet access, or
+an external key-management service to operate after identity material and policy
+are provisioned.
+
+That makes it suitable for controlled pilots in air-gapped labs, sovereign
+enclaves, tactical test ranges, and other environments where external service
+dependencies are prohibited or operationally unacceptable.
+
 ## Defence Outcomes
 
 A successful Syntriass deployment produces concrete defensive outcomes:
