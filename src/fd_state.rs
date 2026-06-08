@@ -7,7 +7,7 @@
 use crate::crypto::{CipherSuite, InitiatorState, SessionKeys};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroize;
 
 pub const MAX_WIRE_RX_BUFFER: usize = 16 * 1024 * 1024;
@@ -109,5 +109,15 @@ fn append_bounded(buf: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<(), B
     Ok(())
 }
 
-/// Global fd -> state registry. Single Mutex is intentional for a PoC.
-pub static REGISTRY: Lazy<Mutex<HashMap<i32, FdState>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// Global fd -> state registry.
+///
+/// The outer `Mutex<HashMap>` is the *global registry lock*: it guards only map
+/// operations (insert / lookup-and-clone / remove) and is never held across a
+/// blocking syscall. Each fd owns its own `Arc<Mutex<FdState>>`; callers clone
+/// the `Arc` out under the short global lock, release it, then take the per-fd
+/// lock for the blocking I/O. This keeps connections independent and lets a
+/// `close` remove an fd while another thread is mid-I/O on it: removing the map
+/// entry only drops the registry's `Arc` reference, so the in-flight thread's
+/// clone keeps the `FdState` (and its zeroizing `Drop`) alive until it finishes.
+pub static REGISTRY: Lazy<Mutex<HashMap<i32, Arc<Mutex<FdState>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));

@@ -26,11 +26,13 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 APP = str(HERE / "vulnerable_app.py")
 MARKER = b"CONFIDENTIAL_MISSION_DATA_STREAM"
+HDR_LEN = 4  # frame header: [body_len: 4 BE] precedes [suite_id][tag][payload]
 CLIENT_ED_SEED = "11" * 32
 CLIENT_ML_SEED = "22" * 32
 SERVER_ED_SEED = "33" * 32
@@ -65,12 +67,23 @@ def derive_identity(tool: str, ed_seed: str, ml_seed: str) -> dict[str, str]:
     return result
 
 
+def overlay_suite() -> str:
+    """Suite token the harness propagates to BOTH children.
+
+    Read once from the parent environment so that
+    `SYNTRIASS_SUITE=0x02 python3 verify_wire.py` actually exercises 0x02
+    instead of being silently overwritten back to 0x01. Defaults to 0x01.
+    """
+    return os.environ.get("SYNTRIASS_SUITE", "0x01")
+
+
 def identity_env(tool: str, role: str) -> dict[str, str]:
+    suite = overlay_suite()
     client = derive_identity(tool, CLIENT_ED_SEED, CLIENT_ML_SEED)
     server = derive_identity(tool, SERVER_ED_SEED, SERVER_ML_SEED)
     if role == "client":
         return {
-            "SYNTRIASS_SUITE": "0x01",
+            "SYNTRIASS_SUITE": suite,
             "SYNTRIASS_ED25519_SEED_HEX": CLIENT_ED_SEED,
             "SYNTRIASS_MLDSA65_SEED_HEX": CLIENT_ML_SEED,
             "SYNTRIASS_PEER_ED25519_PUB_HEX": server["ed25519_public"],
@@ -78,13 +91,38 @@ def identity_env(tool: str, role: str) -> dict[str, str]:
         }
     if role == "server":
         return {
-            "SYNTRIASS_SUITE": "0x01",
+            "SYNTRIASS_SUITE": suite,
             "SYNTRIASS_ED25519_SEED_HEX": SERVER_ED_SEED,
             "SYNTRIASS_MLDSA65_SEED_HEX": SERVER_ML_SEED,
             "SYNTRIASS_PEER_ED25519_PUB_HEX": client["ed25519_public"],
             "SYNTRIASS_PEER_MLDSA65_PUB_HEX": client["mldsa65_public"],
         }
     raise ValueError(role)
+
+
+# Canonical suite tokens -> the 1-byte suite id that travels in the frame header.
+# Mirrors crypto::parse_suite_token for the two forms this harness emits.
+_SUITE_TOKEN_TO_ID = {
+    "0x01": 0x01, "1": 0x01, "768": 0x01, "nist768": 0x01,
+    "0x02": 0x02, "2": 0x02, "1024": 0x02, "nist1024": 0x02,
+}
+
+
+def expected_suite_id() -> Optional[int]:
+    return _SUITE_TOKEN_TO_ID.get(overlay_suite().strip().lower())
+
+
+def wire_suite_id(wire: bytes) -> Optional[int]:
+    """Extract the suite id the child actually emitted on the wire.
+
+    Overlay frames are [body_len: 4 BE][suite_id: 1][tag: 1][payload...].
+    Only the payload is encrypted; the suite id is in cleartext in the header,
+    so the first captured frame is tamper-proof evidence of which suite the
+    preloaded child negotiated -- independent of what we *think* we set.
+    """
+    if len(wire) < HDR_LEN + 1:
+        return None
+    return wire[HDR_LEN]
 
 
 def free_port() -> int:
@@ -155,8 +193,8 @@ class Relay:
 
 def run_scenario(
     *,
-    lib: str | None,
-    tool: str | None,
+    lib: Optional[str],
+    tool: Optional[str],
     preload_client: bool,
     preload_server: bool,
     tamper: bool = False,
@@ -210,6 +248,12 @@ def main() -> int:
         print(f"FAIL: {e}")
         return 1
 
+    suite_tok = overlay_suite()
+    exp_id = expected_suite_id()
+    exp_str = f"{exp_id:#04x}" if exp_id is not None else "UNKNOWN"
+    print(f"== Propagating SYNTRIASS_SUITE={suite_tok!r} to both children "
+          f"(expected wire suite id: {exp_str}) ==\n")
+
     print("== Scenario 1: BASELINE (no overlay) ==")
     wire, out, _client = run_scenario(
         lib=None, tool=None, preload_client=False, preload_server=False
@@ -232,6 +276,17 @@ def main() -> int:
     if MARKER.decode() not in out:
         print("FAIL: server did not receive correct plaintext under overlay")
         return 1
+    seen_id = wire_suite_id(wire)
+    seen_str = f"{seen_id:#04x}" if seen_id is not None else "<none>"
+    print(f"   wire suite id (cleartext frame header, what the child actually "
+          f"negotiated): {seen_str}")
+    if exp_id is not None:
+        if seen_id != exp_id:
+            print(f"FAIL: child negotiated suite {seen_str}, but the parent "
+                  f"requested {exp_id:#04x} -- suite was not propagated")
+            return 1
+        print(f"   confirmed: child used the parent's suite {exp_id:#04x}, "
+              f"not a hardcoded default")
     print(f"OK: wire is opaque ({len(wire)} bytes, no marker) AND server saw plaintext\n")
 
     print("== Scenario 3: TAMPERED AUTHENTICATED HANDSHAKE ==")

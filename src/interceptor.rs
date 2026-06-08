@@ -10,6 +10,7 @@ use crate::crypto::{self, CipherSuite};
 use crate::fd_state::{FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY};
 use libc::{c_int, c_void, iovec, msghdr, size_t, ssize_t};
 use once_cell::sync::OnceCell;
+use std::sync::{Arc, Mutex};
 use std::{cmp, ptr, slice};
 use zeroize::Zeroize;
 
@@ -276,6 +277,15 @@ fn drive_handshake(st: &mut FdState) {
     }
 }
 
+/// Clone the per-fd `Arc` out of the registry under the *global* lock, then drop
+/// the registry guard. The returned `Arc` outlives the global lock; the caller
+/// takes the per-fd lock only after this function has returned, so no registry
+/// guard is ever alive at the point of a per-fd `.lock()`.
+fn lookup(fd: c_int) -> Option<Arc<Mutex<FdState>>> {
+    let reg = REGISTRY.lock().unwrap();
+    reg.get(&fd).cloned()
+}
+
 unsafe fn ensure_tracked(fd: c_int) -> bool {
     {
         let reg = REGISTRY.lock().unwrap();
@@ -288,15 +298,18 @@ unsafe fn ensure_tracked(fd: c_int) -> bool {
     }
     let suite = failed_policy_suite();
     let mut reg = REGISTRY.lock().unwrap();
-    reg.entry(fd).or_insert_with(|| match policy() {
-        Ok(suite) => FdState::responder(suite),
-        Err(()) => FdState::failed(suite),
+    reg.entry(fd).or_insert_with(|| {
+        Arc::new(Mutex::new(match policy() {
+            Ok(suite) => FdState::responder(suite),
+            Err(()) => FdState::failed(suite),
+        }))
     });
     true
 }
 
 unsafe fn install_initiator_state(fd: c_int) {
     let suite_for_failure = failed_policy_suite();
+    // All crypto runs before the global lock is taken; no I/O under the lock.
     let state = match (policy(), crypto::resolve_identity()) {
         (Ok(suite), Ok(identity)) => {
             let engine = suite.engine();
@@ -313,7 +326,7 @@ unsafe fn install_initiator_state(fd: c_int) {
         _ => FdState::failed(suite_for_failure),
     };
     let mut reg = REGISTRY.lock().unwrap();
-    reg.insert(fd, state);
+    reg.insert(fd, Arc::new(Mutex::new(state)));
 }
 
 unsafe fn drive_until_active_for_write(
@@ -390,11 +403,18 @@ unsafe fn append_or_flush(
 }
 
 unsafe fn overlay_send(fd: c_int, plaintext: &[u8], flags: c_int) -> ssize_t {
-    let mut reg = REGISTRY.lock().unwrap();
-    let Some(st) = reg.get_mut(&fd) else {
+    let Some(state) = lookup(fd) else {
         set_errno(libc::EBADF);
         return -1;
     };
+    // Per-fd lock taken exactly once here; the global registry lock is already
+    // released (dropped inside `lookup`). All blocking I/O below runs under this
+    // single guard and never re-locks this mutex on this thread.
+    // Sharp edge: std `Mutex` is non-reentrant and `.unwrap()` aborts on poison;
+    // with `panic = "abort"` a mid-I/O panic is fatal for this connection. Known,
+    // to revisit later -- error handling unchanged this round.
+    let mut st_guard = state.lock().unwrap();
+    let st = &mut *st_guard;
     let blocking = is_blocking(fd);
     if let Err(e) = drive_until_active_for_write(fd, st, flags, blocking) {
         set_errno(e);
@@ -479,11 +499,18 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
         set_errno(libc::EFAULT);
         return -1;
     }
-    let mut reg = REGISTRY.lock().unwrap();
-    let Some(st) = reg.get_mut(&fd) else {
+    let Some(state) = lookup(fd) else {
         set_errno(libc::EBADF);
         return -1;
     };
+    // Per-fd lock taken exactly once here; the global registry lock is already
+    // released (dropped inside `lookup`). All blocking I/O below runs under this
+    // single guard and never re-locks this mutex on this thread.
+    // Sharp edge: std `Mutex` is non-reentrant and `.unwrap()` aborts on poison;
+    // with `panic = "abort"` a mid-I/O panic is fatal for this connection. Known,
+    // to revisit later -- error handling unchanged this round.
+    let mut st_guard = state.lock().unwrap();
+    let st = &mut *st_guard;
     let blocking = is_blocking(fd);
 
     loop {
@@ -837,8 +864,15 @@ pub unsafe extern "C" fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> s
 /// # Safety
 /// `fd` must follow the normal libc `close` contract.
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
-    let mut reg = REGISTRY.lock().unwrap();
-    reg.remove(&fd);
-    drop(reg);
+    // Global lock only: remove the map entry and drop the registry's `Arc`.
+    // If another thread holds a cloned `Arc` and is mid-I/O on this fd, its clone
+    // keeps the `FdState` (and its zeroizing `Drop`) alive until it finishes --
+    // no use-after-free. We do not hold the per-fd lock here, so `close` cannot
+    // block behind a thread parked in a blocking read.
+    let removed = {
+        let mut reg = REGISTRY.lock().unwrap();
+        reg.remove(&fd)
+    };
+    drop(removed);
     (real().close)(fd)
 }
