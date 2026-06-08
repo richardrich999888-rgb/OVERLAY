@@ -26,6 +26,102 @@ Syntriass is intended for deployments where both peers are controlled, identity
 material can be provisioned out of band, and the operator wants a strict
 fail-closed runtime layer rather than a permissive best-effort shim.
 
+## Business Use Cases
+
+Syntriass Overlay is aimed at organizations that need to raise the security
+level of existing TCP systems without waiting for a full application rewrite.
+
+| Environment | Business need | Syntriass outcome |
+| --- | --- | --- |
+| Defence networks | Protect sensitive service-to-service traffic inside controlled enclaves | Plaintext TCP is replaced with authenticated encrypted overlay records |
+| Critical infrastructure | Harden legacy operational services without changing brittle application code | Runtime transport protection can be added through process launch policy |
+| Defence contractors | Reduce exposure of engineering, logistics, telemetry, and mission-support data | Wire captures no longer reveal protected application payloads |
+| Secure labs and test ranges | Isolate experiments and prototypes from passive network observation | Overlay traffic remains opaque while the legacy app interface stays unchanged |
+| Government modernization programs | Bridge old systems into post-quantum migration plans | Hybrid classical plus post-quantum key exchange and identity authentication are introduced at the runtime layer |
+| Red/blue evaluation ranges | Prove whether a legacy application leaks data on the wire | Harnesses compare baseline plaintext leakage against protected overlay traffic |
+
+## Defence Outcomes
+
+A successful Syntriass deployment produces concrete defensive outcomes:
+
+- Network captures show nonzero overlay traffic but not the protected plaintext
+  marker or application payload.
+- The application continues to receive and send ordinary plaintext through its
+  existing APIs.
+- Unauthenticated peers are rejected before plaintext reaches the application.
+- Tampered handshakes and tampered records fail closed.
+- Policy mismatch prevents silent downgrade.
+- Forked child processes cannot reuse inherited AES-GCM nonce counters.
+- Alternate egress syscalls cannot write plaintext onto protected stream
+  sockets.
+
+The operational result is a measurable reduction in plaintext exposure for
+legacy TCP workflows while preserving the application behavior operators already
+depend on.
+
+## Novelty
+
+Syntriass is novel because it combines several controls that are usually handled
+separately:
+
+- Runtime socket interposition for unmodified applications.
+- Authenticated hybrid classical plus post-quantum key exchange.
+- Dual classical and post-quantum identity signatures.
+- Process-pinned suite policy with no downgrade path.
+- Fail-closed syscall coverage for common plaintext bypass routes.
+- Fork-aware AEAD nonce protection for inherited file descriptors.
+- End-to-end relay tests that prove opacity by inspecting captured wire bytes.
+
+The important distinction is not only that the tunnel is post-quantum hybrid.
+The stronger property is that the runtime layer is designed to fail closed when
+applications attempt alternate fd operations that would otherwise bypass the
+cryptographic path.
+
+## Critical Defence Problems Solved
+
+Syntriass addresses several high-priority defence problems:
+
+- **Legacy plaintext exposure:** many mission, logistics, lab, and industrial
+  systems still move sensitive data over ordinary TCP.
+- **Slow modernization cycles:** replacing legacy applications may take years;
+  Syntriass can protect selected traffic without source-code changes.
+- **Harvest-now, decrypt-later risk:** adversaries can record today's encrypted
+  traffic and wait for future cryptanalytic capability. Hybrid post-quantum
+  key exchange reduces that long-term confidentiality risk.
+- **Weak peer identity:** anonymous encryption is not enough for controlled
+  defence environments. Syntriass requires explicit peer public-key trust.
+- **Downgrade risk:** process-pinned policy and suite equality checks prevent a
+  peer or intermediary from silently forcing a weaker suite.
+- **Plaintext bypass through mixed I/O APIs:** legacy programs often mix
+  `send`, `write`, `sendmsg`, `sendfile`, or `splice`. Syntriass covers or
+  blocks those paths for stream sockets.
+- **Fork-after-connect nonce reuse:** inherited active sessions are failed
+  before a child can seal a record with duplicated counters.
+
+## Why This Matters for the Next Five Years
+
+For the 2026-2031 defence planning window, post-quantum transition is no longer
+only a research topic. High-value networks need migration paths that can protect
+existing systems while application teams work through slower modernization
+cycles.
+
+This class of control becomes operationally mandatory for high-assurance
+environments because:
+
+- Sensitive traffic captured today may remain valuable for years.
+- Legacy applications will outlive the first phase of post-quantum migration.
+- Defence systems need cryptographic agility without waiting for every vendor
+  or internal application owner to ship new code.
+- Identity-bound transport protection is required to prevent unauthenticated
+  systems from joining trusted workflows.
+- Fail-open runtime behavior is unacceptable for mission and critical
+  infrastructure networks.
+
+Syntriass does not claim to replace native secure transports in new
+applications. Its role is to close the gap for systems that must continue
+operating while defence organizations move toward post-quantum, identity-bound,
+fail-closed network security.
+
 ## Defence Use Cases
 
 - Protect legacy TCP services in enclaves, labs, test ranges, or private
