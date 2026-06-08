@@ -262,14 +262,18 @@ suite = "nist768"
 
 ## Identity Provisioning
 
-Environment variables:
+### Identity Provisioning Specifications
 
-```text
-SYNTRIASS_ED25519_SEED_HEX
-SYNTRIASS_MLDSA65_SEED_HEX
-SYNTRIASS_PEER_ED25519_PUB_HEX
-SYNTRIASS_PEER_MLDSA65_PUB_HEX
-```
+Identity key packages require exact byte bounds. The system accepts raw 32-byte
+cryptographic seeds for local generation, and expects fully formed,
+uncompressed NIST public keys for peer verification.
+
+| Configuration Variable | Key Type | Raw Size | Representation in TOML/Env |
+| --- | --- | --- | --- |
+| `SYNTRIASS_ED25519_SEED_HEX` | Ed25519 Seed | 32 Bytes | 64 Hex Characters |
+| `SYNTRIASS_MLDSA65_SEED_HEX` | ML-DSA-65 Seed | 32 Bytes | 64 Hex Characters |
+| `SYNTRIASS_PEER_ED25519_PUB_HEX` | Ed25519 Public | 32 Bytes | 64 Hex Characters |
+| `SYNTRIASS_PEER_MLDSA65_PUB_HEX` | ML-DSA-65 Public | 1,952 Bytes | 3,904 Hex Characters |
 
 Equivalent file configuration:
 
@@ -299,12 +303,12 @@ Outbound flow:
 
 ```text
 application plaintext
-  -> intercepted send/write/sendmsg path
+  -> intercepted send/write/writev/sendmsg path
   -> fd registry lookup or stream-socket adoption
   -> authenticated handshake if not active
   -> SessionKeys::seal()
   -> Syntriass frame
-  -> real libc send()
+  -> real libc send() or write()
   -> network
 ```
 
@@ -312,13 +316,13 @@ Inbound flow:
 
 ```text
 network
-  -> real libc recv()
+  -> real libc recv() or read()
   -> wire buffer
   -> frame reassembly
   -> suite/type validation
   -> SessionKeys::open()
   -> plaintext buffer
-  -> application recv/read/recvmsg result
+  -> application recv/read/readv/recvmsg result
 ```
 
 If any required step fails, the fd state becomes `Failed` and later operations
@@ -550,8 +554,14 @@ tests/
   status before production deployment.
 - This layer does not replace network segmentation, host hardening, endpoint
   monitoring, or application-level authorization.
-- The fork PID guard closes inherited-session nonce reuse. It is not a general
-  solution for all multithreaded fork hazards in preload libraries.
+- **Multi-threaded fork constraints:** the fork PID guard cleanly isolates and
+  fails closed active descriptors inherited by a child process. However, because
+  POSIX `fork()` copies only the invoking thread, any concurrent thread holding
+  an internal registry, file descriptor state, allocator, or other process mutex
+  at the moment of invocation can leave that lock permanently unavailable in the
+  child. Syntriass is architected for single-threaded or pre-fork multi-process
+  network daemons; running it inside multi-threaded applications that execute
+  post-connect forks is an unsupported configuration.
 
 ## Status
 
