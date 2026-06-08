@@ -122,6 +122,7 @@ fn summarize(label: &str, mut samples_ms: Vec<f64>) {
 }
 
 #[test]
+#[ignore = "benchmark; run with `cargo test --release -- --ignored` or by name"]
 fn bench_handshake_latency() {
     let r = raw_identities();
     let warmup = 30;
@@ -165,6 +166,7 @@ fn bench_handshake_latency() {
 }
 
 #[test]
+#[ignore = "benchmark; run with `cargo test --release -- --ignored` or by name"]
 fn bench_handshake_size() {
     let r = raw_identities();
     println!("\n== Handshake wire size ==");
@@ -190,6 +192,7 @@ fn bench_handshake_size() {
 }
 
 #[test]
+#[ignore = "benchmark; run with `cargo test --release -- --ignored` or by name"]
 fn bench_aead_throughput() {
     use super::SessionKeys;
     // Build one established session via a real handshake, then stream records.

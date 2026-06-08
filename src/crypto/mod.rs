@@ -28,7 +28,7 @@ use ml_dsa::{
 };
 use once_cell::sync::Lazy;
 use std::fmt;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use zeroize::Zeroize;
 
 /// X25519 public-key length, shared by all suites.
@@ -141,8 +141,15 @@ impl CipherSuite {
 }
 
 /// Long-term local identity plus the exact peer identity this process trusts.
-/// Secret signing keys are intentionally not cached process-wide by the
-/// interceptor; each handshake loads them and drops them after use.
+///
+/// The constructed material (with expanded Ed25519/ML-DSA-65 signing keys) is
+/// built once and cached process-wide behind an `Arc` in `RUNTIME_CONFIG`;
+/// handshakes clone the `Arc` instead of re-expanding the keys, which is the
+/// dominant per-handshake cost. The root seeds are *not* retained after
+/// construction (they are zeroized when the transient `CachedIdentityConfig`
+/// drops), so caching the derived keys does not widen secret residency beyond
+/// what holding the seeds already implied. All key material zeroizes on drop,
+/// and the cache is rebuilt on config hot-reload.
 pub struct IdentityMaterial {
     own_ed25519: Ed25519SigningKey,
     own_mldsa65: MlDsaSigningKey<MlDsa65>,
@@ -202,7 +209,10 @@ impl Drop for CachedIdentityConfig {
 
 struct RuntimeConfig {
     policy: Result<CipherSuite, &'static str>,
-    identity: Result<CachedIdentityConfig, CryptoError>,
+    /// Fully-constructed identity, shared by reference across handshakes so the
+    /// Ed25519/ML-DSA key expansion happens once per config epoch, not per
+    /// handshake.
+    identity: Result<Arc<IdentityMaterial>, CryptoError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,9 +331,15 @@ impl Drop for IdentityMaterial {
 // ----------------------- Late-binding policy resolution -----------------------
 
 fn load_runtime_config() -> RuntimeConfig {
+    // Build the identity (expand signing keys) once here; the transient
+    // `CachedIdentityConfig` carrying the raw seeds is dropped (and zeroized)
+    // as soon as the material is constructed.
+    let identity = read_identity_config_from_sources()
+        .and_then(|cfg| cfg.to_material())
+        .map(Arc::new);
     RuntimeConfig {
         policy: read_policy_from_sources(),
-        identity: read_identity_config_from_sources(),
+        identity,
     }
 }
 
@@ -363,12 +379,15 @@ fn read_policy_from_sources() -> Result<CipherSuite, &'static str> {
     Ok(CipherSuite::NistStandard768)
 }
 
-pub fn resolve_identity() -> Result<IdentityMaterial, CryptoError> {
+/// Return the process-wide identity, cloning the cached `Arc` (cheap) rather
+/// than re-expanding the signing keys (expensive). The cache is refreshed by
+/// `reload_runtime_config` on config hot-reload.
+pub fn resolve_identity() -> Result<Arc<IdentityMaterial>, CryptoError> {
     let guard = RUNTIME_CONFIG
         .read()
         .map_err(|_| CryptoError::BadIdentityConfig)?;
     match &guard.identity {
-        Ok(identity) => identity.to_material(),
+        Ok(identity) => Ok(Arc::clone(identity)),
         Err(e) => Err(*e),
     }
 }
