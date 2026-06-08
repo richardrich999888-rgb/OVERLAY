@@ -11,3 +11,12 @@
 pub mod crypto;
 pub mod fd_state;
 pub mod interceptor;
+
+/// Starts the Linux configuration hot-reload worker.
+///
+/// The interceptor starts this lazily when the fd registry is initialized, but
+/// embedding applications and tests can call this explicitly. On non-Linux
+/// targets the worker reports that hot reload is unsupported and exits.
+pub fn start_config_hot_reloader() {
+    fd_state::start_config_hot_reloader();
+}

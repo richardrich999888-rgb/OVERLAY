@@ -2,6 +2,7 @@
 # Selects the process-wide, policy-pinned cipher suite.
 # Accepted values: nist768 | nist1024 | 768 | 1024 | 0x01 | 0x02
 #
-# This is read ONCE at process start. The SYNTRIASS_SUITE env var, if set,
-# overrides this file. There is no legacy/no-PQC suite and no wire downgrade.
+# The runtime watches /etc/syntriass/ for updates and reloads this file
+# fail-closed. The SYNTRIASS_SUITE env var, if set, overrides this file.
+# There is no legacy/no-PQC suite and no wire downgrade.
 suite = "nist768"

@@ -1,9 +1,10 @@
 //! Cryptographic core for the Syntriass overlay, with runtime cipher agility.
 //!
-//! Late binding: the active `CipherSuite` is resolved once at process start from
-//! `SYNTRIASS_SUITE` (env) or `/etc/syntriass/policy.toml`, and pinned. Suites
-//! are negotiated over the wire only within what local policy permits; there is
-//! no legacy/no-PQC fallback and no silent downgrade (fail closed).
+//! Late binding: the active `CipherSuite` is resolved from `SYNTRIASS_SUITE`
+//! (env) or `/etc/syntriass/policy.toml`, cached, and refreshed by the runtime
+//! hot-reload worker. Suites are negotiated over the wire only within what local
+//! policy permits; there is no legacy/no-PQC fallback and no silent downgrade
+//! (fail closed).
 //!
 //! Submodules:
 //!   * `generic`  - the shared X25519+ML-KEM construction, generic over KemCore.
@@ -23,7 +24,9 @@ use ml_dsa::{
     EncodedVerifyingKey, Keypair, MlDsa65, Signature as MlDsaSignature, Signer as MlDsaSigner,
     SigningKey as MlDsaSigningKey, Verifier as MlDsaVerifier, VerifyingKey as MlDsaVerifyingKey,
 };
+use once_cell::sync::Lazy;
 use std::fmt;
+use std::sync::RwLock;
 use zeroize::Zeroize;
 
 /// X25519 public-key length, shared by all suites.
@@ -39,7 +42,7 @@ pub const IDENTITY_PUBLIC_LEN: usize = ED25519_PUBLIC_LEN + MLDSA65_PUBLIC_LEN;
 pub const IDENTITY_SIGNATURE_LEN: usize = ED25519_SIGNATURE_LEN + MLDSA65_SIGNATURE_LEN;
 
 /// Errors that never panic the host process.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
     BadHelloLength,
     BadIdentityConfig,
@@ -168,6 +171,46 @@ pub struct IdentitySignatures {
     pub mldsa65: Vec<u8>,
 }
 
+struct CachedIdentityConfig {
+    own_ed25519_seed: [u8; ED25519_SEED_LEN],
+    own_mldsa65_seed: [u8; MLDSA65_SEED_LEN],
+    peer_ed25519_public: [u8; ED25519_PUBLIC_LEN],
+    peer_mldsa65_public: Vec<u8>,
+}
+
+impl CachedIdentityConfig {
+    fn to_material(&self) -> Result<IdentityMaterial, CryptoError> {
+        IdentityMaterial::from_bytes(
+            self.own_ed25519_seed,
+            self.own_mldsa65_seed,
+            self.peer_ed25519_public,
+            self.peer_mldsa65_public.clone(),
+        )
+    }
+}
+
+impl Drop for CachedIdentityConfig {
+    fn drop(&mut self) {
+        self.own_ed25519_seed.zeroize();
+        self.own_mldsa65_seed.zeroize();
+        self.peer_ed25519_public.zeroize();
+        self.peer_mldsa65_public.zeroize();
+    }
+}
+
+struct RuntimeConfig {
+    policy: Result<CipherSuite, &'static str>,
+    identity: Result<CachedIdentityConfig, CryptoError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeConfigError {
+    Poisoned,
+}
+
+static RUNTIME_CONFIG: Lazy<RwLock<RuntimeConfig>> =
+    Lazy::new(|| RwLock::new(load_runtime_config()));
+
 impl IdentityMaterial {
     pub fn from_bytes(
         mut own_ed25519_seed: [u8; ED25519_SEED_LEN],
@@ -275,7 +318,23 @@ impl Drop for IdentityMaterial {
 
 // ----------------------- Late-binding policy resolution -----------------------
 
-/// Resolve the process-wide active suite ONCE, from env then config file.
+fn load_runtime_config() -> RuntimeConfig {
+    RuntimeConfig {
+        policy: read_policy_from_sources(),
+        identity: read_identity_config_from_sources(),
+    }
+}
+
+pub fn reload_runtime_config() -> Result<(), RuntimeConfigError> {
+    let next = load_runtime_config();
+    let mut guard = RUNTIME_CONFIG
+        .write()
+        .map_err(|_| RuntimeConfigError::Poisoned)?;
+    *guard = next;
+    Ok(())
+}
+
+/// Resolve the process-wide active suite from the reloadable runtime cache.
 /// Order: `SYNTRIASS_SUITE` env var wins; else `/etc/syntriass/policy.toml`;
 /// else a safe default of NistStandard768.
 ///
@@ -283,6 +342,13 @@ impl Drop for IdentityMaterial {
 /// `0x02`/`2`/`1024`/`nist1024` (case-insensitive). Anything else -> error,
 /// and the caller fails closed rather than guessing.
 pub fn resolve_policy() -> Result<CipherSuite, &'static str> {
+    let guard = RUNTIME_CONFIG
+        .read()
+        .map_err(|_| "SYNTRIASS runtime config lock poisoned")?;
+    guard.policy
+}
+
+fn read_policy_from_sources() -> Result<CipherSuite, &'static str> {
     if let Ok(val) = std::env::var("SYNTRIASS_SUITE") {
         return parse_suite_token(val.trim());
     }
@@ -296,6 +362,16 @@ pub fn resolve_policy() -> Result<CipherSuite, &'static str> {
 }
 
 pub fn resolve_identity() -> Result<IdentityMaterial, CryptoError> {
+    let guard = RUNTIME_CONFIG
+        .read()
+        .map_err(|_| CryptoError::BadIdentityConfig)?;
+    match &guard.identity {
+        Ok(identity) => identity.to_material(),
+        Err(e) => Err(*e),
+    }
+}
+
+fn read_identity_config_from_sources() -> Result<CachedIdentityConfig, CryptoError> {
     let file = std::fs::read_to_string("/etc/syntriass/identity.toml").ok();
     let own_ed_seed = read_identity_hex::<ED25519_SEED_LEN>(
         "SYNTRIASS_ED25519_SEED_HEX",
@@ -318,7 +394,12 @@ pub fn resolve_identity() -> Result<IdentityMaterial, CryptoError> {
         file.as_deref(),
         MLDSA65_PUBLIC_LEN,
     )?;
-    IdentityMaterial::from_bytes(own_ed_seed, own_ml_seed, peer_ed_public, peer_ml_public)
+    Ok(CachedIdentityConfig {
+        own_ed25519_seed: own_ed_seed,
+        own_mldsa65_seed: own_ml_seed,
+        peer_ed25519_public: peer_ed_public,
+        peer_mldsa65_public: peer_ml_public,
+    })
 }
 
 /// Minimal zero-dependency reader for a single `suite = "<value>"` line.

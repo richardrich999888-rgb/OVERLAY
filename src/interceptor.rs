@@ -12,6 +12,7 @@ use crate::fd_state::{current_pid, FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTR
 use libc::c_uint;
 use libc::{c_int, c_void, iovec, msghdr, size_t, ssize_t};
 use once_cell::sync::OnceCell;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::{cmp, ptr, slice};
 use zeroize::Zeroize;
@@ -24,18 +25,32 @@ const MAX_FRAME_BODY: usize = MAX_WIRE_RX_BUFFER - HDR_LEN;
 const MAX_RECORD_PLAINTEXT: usize = 64 * 1024;
 const MAX_IOV_COPY: usize = 16 * 1024 * 1024;
 
-static POLICY: OnceCell<Result<CipherSuite, &'static str>> = OnceCell::new();
-
 fn policy() -> Result<CipherSuite, ()> {
-    POLICY
-        .get_or_init(crypto::resolve_policy)
-        .as_ref()
-        .copied()
-        .map_err(|_| ())
+    crypto::resolve_policy().map_err(|_| ())
 }
 
 fn failed_policy_suite() -> CipherSuite {
     policy().unwrap_or(CipherSuite::NistStandard768)
+}
+
+fn ffi_guard_c_int(f: impl FnOnce() -> c_int) -> c_int {
+    match panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => unsafe {
+            set_errno(libc::EIO);
+            -1
+        },
+    }
+}
+
+fn ffi_guard_ssize(f: impl FnOnce() -> ssize_t) -> ssize_t {
+    match panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => unsafe {
+            set_errno(libc::EIO);
+            -1
+        },
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -482,6 +497,10 @@ unsafe fn overlay_send(fd: c_int, plaintext: &[u8], flags: c_int) -> ssize_t {
         set_errno(libc::EPIPE);
         return -1;
     }
+    if st.fail_if_stale_idle_config() {
+        set_errno(libc::EPIPE);
+        return -1;
+    }
     let blocking = is_blocking(fd);
     if let Err(e) = drive_until_active_for_write(fd, st, flags, blocking) {
         set_errno(e);
@@ -579,6 +598,10 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
     let mut st_guard = state.lock().unwrap();
     let st = &mut *st_guard;
     if inherited_after_fork(st) {
+        set_errno(libc::EPIPE);
+        return -1;
+    }
+    if st.fail_if_stale_idle_config() {
         set_errno(libc::EPIPE);
         return -1;
     }
@@ -794,15 +817,17 @@ pub unsafe extern "C" fn connect(
     addr: *const libc::sockaddr,
     addrlen: libc::socklen_t,
 ) -> c_int {
-    let res = (real().connect)(fd, addr, addrlen);
-    let saved_errno = if res < 0 { errno() } else { 0 };
-    if res == 0 || (res < 0 && saved_errno == libc::EINPROGRESS) {
-        install_initiator_state(fd);
-    }
-    if res < 0 {
-        set_errno(saved_errno);
-    }
-    res
+    ffi_guard_c_int(|| {
+        let res = (real().connect)(fd, addr, addrlen);
+        let saved_errno = if res < 0 { errno() } else { 0 };
+        if res == 0 || (res < 0 && saved_errno == libc::EINPROGRESS) {
+            install_initiator_state(fd);
+        }
+        if res < 0 {
+            set_errno(saved_errno);
+        }
+        res
+    })
 }
 
 #[no_mangle]
@@ -811,17 +836,19 @@ pub unsafe extern "C" fn connect(
 /// # Safety
 /// `buf` must be valid for `len` bytes under the normal libc `send` contract.
 pub unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: size_t, flags: c_int) -> ssize_t {
-    if !ensure_tracked(fd) {
-        return (real().send)(fd, buf, len, flags);
-    }
-    let plaintext = match input_slice(buf, len) {
-        Ok(s) => s,
-        Err(e) => {
-            set_errno(e);
-            return -1;
+    ffi_guard_ssize(|| {
+        if !ensure_tracked(fd) {
+            return (real().send)(fd, buf, len, flags);
         }
-    };
-    overlay_send(fd, plaintext, flags)
+        let plaintext = match input_slice(buf, len) {
+            Ok(s) => s,
+            Err(e) => {
+                set_errno(e);
+                return -1;
+            }
+        };
+        overlay_send(fd, plaintext, flags)
+    })
 }
 
 #[no_mangle]
@@ -839,10 +866,12 @@ pub unsafe extern "C" fn sendto(
     addr: *const libc::sockaddr,
     addrlen: libc::socklen_t,
 ) -> ssize_t {
-    if block_stream_egress(fd) {
-        return -1;
-    }
-    (real().sendto)(fd, buf, len, flags, addr, addrlen)
+    ffi_guard_ssize(|| {
+        if block_stream_egress(fd) {
+            return -1;
+        }
+        (real().sendto)(fd, buf, len, flags, addr, addrlen)
+    })
 }
 
 #[no_mangle]
@@ -852,10 +881,12 @@ pub unsafe extern "C" fn sendto(
 /// `buf` must be valid for writes of `len` bytes under the normal libc `recv`
 /// contract.
 pub unsafe extern "C" fn recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -> ssize_t {
-    if !ensure_tracked(fd) {
-        return (real().recv)(fd, buf, len, flags);
-    }
-    overlay_recv(fd, buf, len, flags)
+    ffi_guard_ssize(|| {
+        if !ensure_tracked(fd) {
+            return (real().recv)(fd, buf, len, flags);
+        }
+        overlay_recv(fd, buf, len, flags)
+    })
 }
 
 #[no_mangle]
@@ -864,17 +895,19 @@ pub unsafe extern "C" fn recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c
 /// # Safety
 /// `buf` must be valid for `len` bytes under the normal libc `write` contract.
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, len: size_t) -> ssize_t {
-    if !ensure_tracked(fd) {
-        return (real().write)(fd, buf, len);
-    }
-    let plaintext = match input_slice(buf, len) {
-        Ok(s) => s,
-        Err(e) => {
-            set_errno(e);
-            return -1;
+    ffi_guard_ssize(|| {
+        if !ensure_tracked(fd) {
+            return (real().write)(fd, buf, len);
         }
-    };
-    overlay_send(fd, plaintext, 0)
+        let plaintext = match input_slice(buf, len) {
+            Ok(s) => s,
+            Err(e) => {
+                set_errno(e);
+                return -1;
+            }
+        };
+        overlay_send(fd, plaintext, 0)
+    })
 }
 
 #[no_mangle]
@@ -884,10 +917,12 @@ pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, len: size_t) -> ss
 /// `buf` must be valid for writes of `len` bytes under the normal libc `read`
 /// contract.
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize_t {
-    if !ensure_tracked(fd) {
-        return (real().read)(fd, buf, len);
-    }
-    overlay_recv(fd, buf, len, 0)
+    ffi_guard_ssize(|| {
+        if !ensure_tracked(fd) {
+            return (real().read)(fd, buf, len);
+        }
+        overlay_recv(fd, buf, len, 0)
+    })
 }
 
 #[no_mangle]
@@ -897,14 +932,16 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, len: size_t) -> ssize
 /// `iov` must reference `iovcnt` valid iovec entries under the normal libc
 /// `writev` contract.
 pub unsafe extern "C" fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
-    if iovcnt < 0 {
-        set_errno(libc::EINVAL);
-        return -1;
-    }
-    if !ensure_tracked(fd) {
-        return (real().writev)(fd, iov, iovcnt);
-    }
-    overlay_write_iov(fd, iov, iovcnt as usize, 0)
+    ffi_guard_ssize(|| {
+        if iovcnt < 0 {
+            set_errno(libc::EINVAL);
+            return -1;
+        }
+        if !ensure_tracked(fd) {
+            return (real().writev)(fd, iov, iovcnt);
+        }
+        overlay_write_iov(fd, iov, iovcnt as usize, 0)
+    })
 }
 
 #[no_mangle]
@@ -914,14 +951,16 @@ pub unsafe extern "C" fn writev(fd: c_int, iov: *const iovec, iovcnt: c_int) -> 
 /// `iov` must reference `iovcnt` valid writable iovec entries under the normal
 /// libc `readv` contract.
 pub unsafe extern "C" fn readv(fd: c_int, iov: *const iovec, iovcnt: c_int) -> ssize_t {
-    if iovcnt < 0 {
-        set_errno(libc::EINVAL);
-        return -1;
-    }
-    if !ensure_tracked(fd) {
-        return (real().readv)(fd, iov, iovcnt);
-    }
-    overlay_read_iov(fd, iov, iovcnt as usize, 0)
+    ffi_guard_ssize(|| {
+        if iovcnt < 0 {
+            set_errno(libc::EINVAL);
+            return -1;
+        }
+        if !ensure_tracked(fd) {
+            return (real().readv)(fd, iov, iovcnt);
+        }
+        overlay_read_iov(fd, iov, iovcnt as usize, 0)
+    })
 }
 
 #[no_mangle]
@@ -931,20 +970,22 @@ pub unsafe extern "C" fn readv(fd: c_int, iov: *const iovec, iovcnt: c_int) -> s
 /// `msg` must be a valid pointer to an `msghdr` whose iovec entries satisfy the
 /// normal libc `sendmsg` contract.
 pub unsafe extern "C" fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) -> ssize_t {
-    if msg.is_null() {
-        set_errno(libc::EFAULT);
-        return -1;
-    }
-    if !ensure_tracked(fd) {
-        return (real().sendmsg)(fd, msg, flags);
-    }
-    let msg_ref = &*msg;
-    overlay_write_iov(
-        fd,
-        msg_ref.msg_iov,
-        msg_iovlen_to_usize(msg_ref.msg_iovlen),
-        flags,
-    )
+    ffi_guard_ssize(|| {
+        if msg.is_null() {
+            set_errno(libc::EFAULT);
+            return -1;
+        }
+        if !ensure_tracked(fd) {
+            return (real().sendmsg)(fd, msg, flags);
+        }
+        let msg_ref = &*msg;
+        overlay_write_iov(
+            fd,
+            msg_ref.msg_iov,
+            msg_iovlen_to_usize(msg_ref.msg_iovlen),
+            flags,
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -961,10 +1002,12 @@ pub unsafe extern "C" fn sendmmsg(
     vlen: c_uint,
     flags: c_int,
 ) -> c_int {
-    if block_stream_egress(fd) {
-        return -1;
-    }
-    (real().sendmmsg)(fd, msgvec, vlen, flags)
+    ffi_guard_c_int(|| {
+        if block_stream_egress(fd) {
+            return -1;
+        }
+        (real().sendmmsg)(fd, msgvec, vlen, flags)
+    })
 }
 
 #[no_mangle]
@@ -974,22 +1017,24 @@ pub unsafe extern "C" fn sendmmsg(
 /// `msg` must be a valid writable pointer to an `msghdr` whose iovec entries
 /// satisfy the normal libc `recvmsg` contract.
 pub unsafe extern "C" fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> ssize_t {
-    if msg.is_null() {
-        set_errno(libc::EFAULT);
-        return -1;
-    }
-    if !ensure_tracked(fd) {
-        return (real().recvmsg)(fd, msg, flags);
-    }
-    let msg_ref = &mut *msg;
-    msg_ref.msg_flags = 0;
-    msg_ref.msg_controllen = 0;
-    overlay_read_iov(
-        fd,
-        msg_ref.msg_iov,
-        msg_iovlen_to_usize(msg_ref.msg_iovlen),
-        flags,
-    )
+    ffi_guard_ssize(|| {
+        if msg.is_null() {
+            set_errno(libc::EFAULT);
+            return -1;
+        }
+        if !ensure_tracked(fd) {
+            return (real().recvmsg)(fd, msg, flags);
+        }
+        let msg_ref = &mut *msg;
+        msg_ref.msg_flags = 0;
+        msg_ref.msg_controllen = 0;
+        overlay_read_iov(
+            fd,
+            msg_ref.msg_iov,
+            msg_iovlen_to_usize(msg_ref.msg_iovlen),
+            flags,
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1006,10 +1051,12 @@ pub unsafe extern "C" fn sendfile(
     offset: *mut libc::off_t,
     count: size_t,
 ) -> ssize_t {
-    if block_stream_egress(out_fd) {
-        return -1;
-    }
-    (real().sendfile)(out_fd, in_fd, offset, count)
+    ffi_guard_ssize(|| {
+        if block_stream_egress(out_fd) {
+            return -1;
+        }
+        (real().sendfile)(out_fd, in_fd, offset, count)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1025,10 +1072,12 @@ pub unsafe extern "C" fn sendfile64(
     offset: *mut libc::off64_t,
     count: size_t,
 ) -> ssize_t {
-    if block_stream_egress(out_fd) {
-        return -1;
-    }
-    (real().sendfile64)(out_fd, in_fd, offset, count)
+    ffi_guard_ssize(|| {
+        if block_stream_egress(out_fd) {
+            return -1;
+        }
+        (real().sendfile64)(out_fd, in_fd, offset, count)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1046,10 +1095,12 @@ pub unsafe extern "C" fn splice(
     len: size_t,
     flags: c_uint,
 ) -> ssize_t {
-    if block_stream_egress(fd_in) || block_stream_egress(fd_out) {
-        return -1;
-    }
-    (real().splice)(fd_in, off_in, fd_out, off_out, len, flags)
+    ffi_guard_ssize(|| {
+        if block_stream_egress(fd_in) || block_stream_egress(fd_out) {
+            return -1;
+        }
+        (real().splice)(fd_in, off_in, fd_out, off_out, len, flags)
+    })
 }
 
 #[no_mangle]
@@ -1058,15 +1109,17 @@ pub unsafe extern "C" fn splice(
 /// # Safety
 /// `fd` must follow the normal libc `close` contract.
 pub unsafe extern "C" fn close(fd: c_int) -> c_int {
-    // Global lock only: remove the map entry and drop the registry's `Arc`.
-    // If another thread holds a cloned `Arc` and is mid-I/O on this fd, its clone
-    // keeps the `FdState` (and its zeroizing `Drop`) alive until it finishes --
-    // no use-after-free. We do not hold the per-fd lock here, so `close` cannot
-    // block behind a thread parked in a blocking read.
-    let removed = {
-        let mut reg = REGISTRY.lock().unwrap();
-        reg.remove(&fd)
-    };
-    drop(removed);
-    (real().close)(fd)
+    ffi_guard_c_int(|| {
+        // Global lock only: remove the map entry and drop the registry's `Arc`.
+        // If another thread holds a cloned `Arc` and is mid-I/O on this fd, its clone
+        // keeps the `FdState` (and its zeroizing `Drop`) alive until it finishes --
+        // no use-after-free. We do not hold the per-fd lock here, so `close` cannot
+        // block behind a thread parked in a blocking read.
+        let removed = {
+            let mut reg = REGISTRY.lock().unwrap();
+            reg.remove(&fd)
+        };
+        drop(removed);
+        (real().close)(fd)
+    })
 }
