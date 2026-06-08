@@ -38,6 +38,16 @@ fn failed_policy_suite() -> CipherSuite {
     policy().unwrap_or(CipherSuite::NistStandard768)
 }
 
+#[cfg(target_os = "linux")]
+fn msg_iovlen_to_usize(len: size_t) -> usize {
+    len
+}
+
+#[cfg(not(target_os = "linux"))]
+fn msg_iovlen_to_usize(len: c_int) -> usize {
+    len as usize
+}
+
 type ConnectFn = unsafe extern "C" fn(c_int, *const libc::sockaddr, libc::socklen_t) -> c_int;
 type SendFn = unsafe extern "C" fn(c_int, *const c_void, size_t, c_int) -> ssize_t;
 type SendtoFn = unsafe extern "C" fn(
@@ -235,18 +245,20 @@ unsafe fn flush_backlog(fd: c_int, st: &mut FdState, flags: c_int) -> Result<boo
             st.tx_backlog.len(),
             flags,
         );
-        if n > 0 {
-            let sent = n as usize;
-            st.tx_backlog[..sent].zeroize();
-            st.tx_backlog.drain(0..sent);
-        } else if n == 0 {
-            return Ok(false);
-        } else {
-            let e = errno();
-            if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
-                return Ok(false);
+        match n.cmp(&0) {
+            cmp::Ordering::Greater => {
+                let sent = n as usize;
+                st.tx_backlog[..sent].zeroize();
+                st.tx_backlog.drain(0..sent);
             }
-            return Err(());
+            cmp::Ordering::Equal => return Ok(false),
+            cmp::Ordering::Less => {
+                let e = errno();
+                if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                    return Ok(false);
+                }
+                return Err(());
+            }
         }
     }
     Ok(true)
@@ -927,7 +939,12 @@ pub unsafe extern "C" fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) ->
         return (real().sendmsg)(fd, msg, flags);
     }
     let msg_ref = &*msg;
-    overlay_write_iov(fd, msg_ref.msg_iov, msg_ref.msg_iovlen as usize, flags)
+    overlay_write_iov(
+        fd,
+        msg_ref.msg_iov,
+        msg_iovlen_to_usize(msg_ref.msg_iovlen),
+        flags,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -967,7 +984,12 @@ pub unsafe extern "C" fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> s
     let msg_ref = &mut *msg;
     msg_ref.msg_flags = 0;
     msg_ref.msg_controllen = 0;
-    overlay_read_iov(fd, msg_ref.msg_iov, msg_ref.msg_iovlen as usize, flags)
+    overlay_read_iov(
+        fd,
+        msg_ref.msg_iov,
+        msg_iovlen_to_usize(msg_ref.msg_iovlen),
+        flags,
+    )
 }
 
 #[cfg(target_os = "linux")]

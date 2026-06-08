@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Alternate-egress fail-closed test for Syntriass overlay."""
+import ctypes
 import errno
 import os
 import socket
@@ -20,6 +21,8 @@ HELLO = b"EGRESS_NORMAL_HELLO"
 DONE = b"EGRESS_NORMAL_DONE"
 SENDTO_MARKER = b"PLAINTEXT_SENDTO_BYPASS_MARKER"
 SENDFILE_MARKER = b"PLAINTEXT_SENDFILE_BYPASS_MARKER"
+SENDFILE64_MARKER = b"PLAINTEXT_SENDFILE64_BYPASS_MARKER"
+SPLICE_MARKER = b"PLAINTEXT_SPLICE_BYPASS_MARKER"
 UDP_MARKER = b"UDP_SENDTO_ALLOWED"
 FILE_MARKER = b"REGULAR_SENDFILE_ALLOWED"
 
@@ -100,6 +103,51 @@ def assert_errno(label: str, expected: int, fn) -> None:
     raise AssertionError(f"{label} unexpectedly succeeded")
 
 
+def sendfile64_to_socket(out_fd: int, in_fd: int, count: int) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        sendfile64 = libc.sendfile64
+    except AttributeError as exc:
+        raise AssertionError("sendfile64 symbol unavailable") from exc
+    sendfile64.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_longlong),
+        ctypes.c_size_t,
+    ]
+    sendfile64.restype = ctypes.c_ssize_t
+    offset = ctypes.c_longlong(0)
+    ctypes.set_errno(0)
+    rc = sendfile64(out_fd, in_fd, ctypes.byref(offset), count)
+    if rc < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return rc
+
+
+def splice_to_socket(pipe_read_fd: int, socket_fd: int, count: int) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        splice = libc.splice
+    except AttributeError as exc:
+        raise AssertionError("splice symbol unavailable") from exc
+    splice.argtypes = [
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    splice.restype = ctypes.c_ssize_t
+    ctypes.set_errno(0)
+    rc = splice(pipe_read_fd, None, socket_fd, None, count, 0)
+    if rc < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return rc
+
+
 def regular_sendfile_passes() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         src_path = Path(tmp) / "src.bin"
@@ -172,6 +220,35 @@ def role_client(port: int) -> int:
             lambda: os.sendfile(sock.fileno(), tmp.fileno(), 0, len(SENDFILE_MARKER)),
         )
 
+    with tempfile.NamedTemporaryFile() as tmp:
+        tmp.write(SENDFILE64_MARKER)
+        tmp.flush()
+        tmp.seek(0)
+        assert_errno(
+            "SENDFILE64_STREAM",
+            errno.EOPNOTSUPP,
+            lambda: sendfile64_to_socket(
+                sock.fileno(),
+                tmp.fileno(),
+                len(SENDFILE64_MARKER),
+            ),
+        )
+
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, SPLICE_MARKER)
+        os.close(write_fd)
+        write_fd = -1
+        assert_errno(
+            "SPLICE_STREAM",
+            errno.EOPNOTSUPP,
+            lambda: splice_to_socket(read_fd, sock.fileno(), len(SPLICE_MARKER)),
+        )
+    finally:
+        if write_fd >= 0:
+            os.close(write_fd)
+        os.close(read_fd)
+
     sock.sendall(DONE)
     if recv_exact(sock, len(DONE)) != DONE:
         print("[client] DONE echo mismatch", flush=True)
@@ -228,7 +305,7 @@ def run_orchestrator() -> int:
     print(server_out.strip())
 
     wire = relay.wire()
-    markers = [SENDTO_MARKER, SENDFILE_MARKER]
+    markers = [SENDTO_MARKER, SENDFILE_MARKER, SENDFILE64_MARKER, SPLICE_MARKER]
     leaked = [m for m in markers if m in wire]
     print(f"stream wire bytes={len(wire)} marker_present={bool(leaked)}")
 
@@ -244,6 +321,8 @@ def run_orchestrator() -> int:
     for required in (
         "SENDTO_STREAM_FAIL errno=95",
         "SENDFILE_STREAM_FAIL errno=95",
+        "SENDFILE64_STREAM_FAIL errno=95",
+        "SPLICE_STREAM_FAIL errno=95",
         "REGULAR_SENDFILE_OK",
         "UDP_SENDTO_OK",
         "NORMAL_STREAM_STILL_OK",
@@ -252,7 +331,7 @@ def run_orchestrator() -> int:
             print(f"FAIL: missing client proof line: {required}")
             return 1
 
-    print("OK: tracked stream sendto/sendfile failed closed")
+    print("OK: tracked stream sendto/sendfile/sendfile64/splice failed closed")
     print("OK: non-stream/non-socket operations passed through")
     print("OK: relay captured nonzero bytes and no plaintext marker")
     return 0

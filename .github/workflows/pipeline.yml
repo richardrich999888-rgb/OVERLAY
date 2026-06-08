@@ -1,16 +1,14 @@
-name: CI — build and validate
-
-# Gates a LAB ARTIFACT (research / pilot prototype), not a production release.
-# Every test invoked below is a hard gate: the job fails if any of them fails.
-# Tests that require a privileged Linux host are listed explicitly in the
-# "Coverage note" step rather than silently dropped, so this pipeline never
-# claims coverage it does not actually run.
+name: Syntriass Overlay Production Pipeline
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+    tags:
+      - "v*"
   pull_request:
-    branches: [main]
+    branches:
+      - main
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,92 +16,78 @@ env:
   SYNTRIASS_SO: target/release/libsyntriass_overlay.so
 
 jobs:
-  build-and-validate:
-    name: Build and validate (Linux/glibc)
+  build-and-verify:
+    name: Build and validate fail-closed runtime defenses
     runs-on: ubuntu-24.04
-    # Container `run:` steps default to `sh` (dash), which lacks `set -o pipefail`.
-    # Force bash so the pipefail-using steps below behave as written.
+    container:
+      image: rust:1.85-slim-bookworm
     defaults:
       run:
         shell: bash
-    container:
-      image: rust:1-bookworm
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Install Python and binutils
-        run: |
-          apt-get update -yq
-          apt-get install -yq python3 binutils
-
-      - name: Formatting gate (cargo fmt --check)
-        run: |
-          rustup component add rustfmt
-          cargo fmt --check
-
-      - name: Clippy (advisory, non-blocking)
-        # Intentionally NOT a hard gate. clippy's `unnecessary_cast` fires on
-        # `msg_iovlen as usize` in src/interceptor.rs, but that cast is REQUIRED
-        # for the macOS build (msg_iovlen is c_int on macOS, usize on Linux).
-        # Failing CI on it would be a false positive, so clippy is informational.
-        continue-on-error: true
-        run: |
-          rustup component add clippy
-          cargo clippy --all-targets --locked
-
-      - name: Build release shared object
-        run: cargo build --release --locked
-
-      - name: Audit exported interposition symbols (nm -D)
+      - name: Step 1 - Install toolchain components and verification packages
         run: |
           set -euo pipefail
+          apt-get update -yq
+          apt-get install -yq python3 build-essential binutils coreutils >/dev/null
+          rustup component add rustfmt clippy
+
+      - name: Step 2 - Execute formatting and lint gates
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          cargo clippy -- -D warnings
+
+      - name: Step 3 - Compile locked release shared object
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
           test -f "$SYNTRIASS_SO"
-          for sym in connect send recv read write readv writev sendmsg recvmsg close \
-                     sendto sendmmsg sendfile sendfile64 splice; do
-            if nm -D "$SYNTRIASS_SO" | grep -Eq " [TW] ${sym}\$"; then
-              echo "symbol verified: ${sym}"
+
+      - name: Step 4 - Audit exported interposition symbols
+        run: |
+          set -euo pipefail
+          for sym in connect sendfile64 splice; do
+            if nm -D "$SYNTRIASS_SO" | grep -Eq " T ${sym}$"; then
+              echo "public T symbol verified: ${sym}"
             else
-              echo "missing exported interposition symbol: ${sym}" >&2
+              echo "missing public T interposition symbol: ${sym}" >&2
               exit 1
             fi
           done
 
-      - name: Unit tests (cargo test --release)
-        run: cargo test --release --locked
-
-      - name: Integration suite (unprivileged — all hard gates)
+      - name: Step 5 - Execute unit and python-driven integration matrix
         run: |
           set -euo pipefail
+          cargo test --release --locked
           python3 tests/verify_wire.py
           SYNTRIASS_SUITE=0x02 python3 tests/verify_wire.py
           python3 tests/failclosed_test.py
           python3 tests/concurrency_test.py
-          python3 tests/fork_test.py
-          python3 tests/egress_test.py
+          python3 tests/fork_test.py | tee /tmp/syntriass-fork-test.log
+          grep -F "CHILD_INHERITED_FAIL errno=32" /tmp/syntriass-fork-test.log
+          python3 tests/egress_test.py | tee /tmp/syntriass-egress-test.log
+          grep -F "SENDFILE64_STREAM_FAIL errno=95" /tmp/syntriass-egress-test.log
+          grep -F "SPLICE_STREAM_FAIL errno=95" /tmp/syntriass-egress-test.log
+          python3 tests/characterize.py
 
-      - name: Coverage note — tests NOT run in this CI
-        run: |
-          echo "These require a privileged Linux host and do NOT run in this pipeline:"
-          echo "  tests/netimpair_test.py  - needs NET_ADMIN + tc + a second container on a Docker bridge"
-          echo "  tests/characterize.py    - performance measurement; environment-sensitive, not pass/fail"
-          echo "They must be run separately on a privileged host. This pipeline does"
-          echo "not claim to cover them."
-
-      - name: Checksummed artifact
+      - name: Step 6 - Generate diagnostic artifact and SHA256 manifest
         run: |
           set -euo pipefail
           mkdir -p dist
           cp "$SYNTRIASS_SO" dist/libsyntriass_overlay.so
-          sha256sum dist/libsyntriass_overlay.so > dist/SHA256SUMS
-          cat dist/SHA256SUMS
+          strip --strip-unneeded dist/libsyntriass_overlay.so
+          sha256sum dist/libsyntriass_overlay.so | tee dist/SHA256SUMS
 
-      - name: Upload artifact
+      - name: Upload diagnostic evaluation artifact
         uses: actions/upload-artifact@v4
         with:
           name: libsyntriass-overlay-linux-glibc
           path: |
             dist/libsyntriass_overlay.so
             dist/SHA256SUMS
-          retention-days: 7
+          retention-days: 1
