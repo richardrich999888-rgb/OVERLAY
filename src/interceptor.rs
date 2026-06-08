@@ -7,7 +7,9 @@
 //! failed so later I/O returns an error instead of leaking plaintext.
 
 use crate::crypto::{self, CipherSuite};
-use crate::fd_state::{FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY};
+use crate::fd_state::{current_pid, FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY};
+#[cfg(target_os = "linux")]
+use libc::c_uint;
 use libc::{c_int, c_void, iovec, msghdr, size_t, ssize_t};
 use once_cell::sync::OnceCell;
 use std::sync::{Arc, Mutex};
@@ -38,6 +40,14 @@ fn failed_policy_suite() -> CipherSuite {
 
 type ConnectFn = unsafe extern "C" fn(c_int, *const libc::sockaddr, libc::socklen_t) -> c_int;
 type SendFn = unsafe extern "C" fn(c_int, *const c_void, size_t, c_int) -> ssize_t;
+type SendtoFn = unsafe extern "C" fn(
+    c_int,
+    *const c_void,
+    size_t,
+    c_int,
+    *const libc::sockaddr,
+    libc::socklen_t,
+) -> ssize_t;
 type RecvFn = unsafe extern "C" fn(c_int, *mut c_void, size_t, c_int) -> ssize_t;
 type WriteFn = unsafe extern "C" fn(c_int, *const c_void, size_t) -> ssize_t;
 type ReadFn = unsafe extern "C" fn(c_int, *mut c_void, size_t) -> ssize_t;
@@ -45,11 +55,27 @@ type WritevFn = unsafe extern "C" fn(c_int, *const iovec, c_int) -> ssize_t;
 type ReadvFn = unsafe extern "C" fn(c_int, *const iovec, c_int) -> ssize_t;
 type SendmsgFn = unsafe extern "C" fn(c_int, *const msghdr, c_int) -> ssize_t;
 type RecvmsgFn = unsafe extern "C" fn(c_int, *mut msghdr, c_int) -> ssize_t;
+#[cfg(target_os = "linux")]
+type SendmmsgFn = unsafe extern "C" fn(c_int, *mut libc::mmsghdr, c_uint, c_int) -> c_int;
+#[cfg(target_os = "linux")]
+type SendfileFn = unsafe extern "C" fn(c_int, c_int, *mut libc::off_t, size_t) -> ssize_t;
+#[cfg(target_os = "linux")]
+type Sendfile64Fn = unsafe extern "C" fn(c_int, c_int, *mut libc::off64_t, size_t) -> ssize_t;
+#[cfg(target_os = "linux")]
+type SpliceFn = unsafe extern "C" fn(
+    c_int,
+    *mut libc::loff_t,
+    c_int,
+    *mut libc::loff_t,
+    size_t,
+    c_uint,
+) -> ssize_t;
 type CloseFn = unsafe extern "C" fn(c_int) -> c_int;
 
 struct RealSyms {
     connect: ConnectFn,
     send: SendFn,
+    sendto: SendtoFn,
     recv: RecvFn,
     write: WriteFn,
     read: ReadFn,
@@ -57,6 +83,14 @@ struct RealSyms {
     readv: ReadvFn,
     sendmsg: SendmsgFn,
     recvmsg: RecvmsgFn,
+    #[cfg(target_os = "linux")]
+    sendmmsg: SendmmsgFn,
+    #[cfg(target_os = "linux")]
+    sendfile: SendfileFn,
+    #[cfg(target_os = "linux")]
+    sendfile64: Sendfile64Fn,
+    #[cfg(target_os = "linux")]
+    splice: SpliceFn,
     close: CloseFn,
 }
 
@@ -75,6 +109,7 @@ fn real() -> &'static RealSyms {
         RealSyms {
             connect: resolve::<ConnectFn>(b"connect\0"),
             send: resolve::<SendFn>(b"send\0"),
+            sendto: resolve::<SendtoFn>(b"sendto\0"),
             recv: resolve::<RecvFn>(b"recv\0"),
             write: resolve::<WriteFn>(b"write\0"),
             read: resolve::<ReadFn>(b"read\0"),
@@ -82,6 +117,14 @@ fn real() -> &'static RealSyms {
             readv: resolve::<ReadvFn>(b"readv\0"),
             sendmsg: resolve::<SendmsgFn>(b"sendmsg\0"),
             recvmsg: resolve::<RecvmsgFn>(b"recvmsg\0"),
+            #[cfg(target_os = "linux")]
+            sendmmsg: resolve::<SendmmsgFn>(b"sendmmsg\0"),
+            #[cfg(target_os = "linux")]
+            sendfile: resolve::<SendfileFn>(b"sendfile\0"),
+            #[cfg(target_os = "linux")]
+            sendfile64: resolve::<Sendfile64Fn>(b"sendfile64\0"),
+            #[cfg(target_os = "linux")]
+            splice: resolve::<SpliceFn>(b"splice\0"),
             close: resolve::<CloseFn>(b"close\0"),
         }
     })
@@ -130,6 +173,14 @@ unsafe fn is_stream_socket(fd: c_int) -> bool {
         &mut slen,
     );
     ok == 0 && stype == libc::SOCK_STREAM
+}
+
+unsafe fn block_stream_egress(fd: c_int) -> bool {
+    if is_stream_socket(fd) {
+        set_errno(libc::EOPNOTSUPP);
+        return true;
+    }
+    false
 }
 
 fn frame(suite_id: u8, tag: u8, payload: &[u8]) -> Result<Vec<u8>, ()> {
@@ -415,6 +466,10 @@ unsafe fn overlay_send(fd: c_int, plaintext: &[u8], flags: c_int) -> ssize_t {
     // to revisit later -- error handling unchanged this round.
     let mut st_guard = state.lock().unwrap();
     let st = &mut *st_guard;
+    if inherited_after_fork(st) {
+        set_errno(libc::EPIPE);
+        return -1;
+    }
     let blocking = is_blocking(fd);
     if let Err(e) = drive_until_active_for_write(fd, st, flags, blocking) {
         set_errno(e);
@@ -511,6 +566,10 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
     // to revisit later -- error handling unchanged this round.
     let mut st_guard = state.lock().unwrap();
     let st = &mut *st_guard;
+    if inherited_after_fork(st) {
+        set_errno(libc::EPIPE);
+        return -1;
+    }
     let blocking = is_blocking(fd);
 
     loop {
@@ -595,6 +654,14 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
             }
         }
     }
+}
+
+fn inherited_after_fork(st: &mut FdState) -> bool {
+    if st.owner_pid == current_pid() {
+        return false;
+    }
+    st.phase = FdPhase::Failed;
+    true
 }
 
 unsafe fn input_slice<'a>(buf: *const c_void, len: size_t) -> Result<&'a [u8], c_int> {
@@ -716,8 +783,12 @@ pub unsafe extern "C" fn connect(
     addrlen: libc::socklen_t,
 ) -> c_int {
     let res = (real().connect)(fd, addr, addrlen);
-    if res == 0 || (res < 0 && errno() == libc::EINPROGRESS) {
+    let saved_errno = if res < 0 { errno() } else { 0 };
+    if res == 0 || (res < 0 && saved_errno == libc::EINPROGRESS) {
         install_initiator_state(fd);
+    }
+    if res < 0 {
+        set_errno(saved_errno);
     }
     res
 }
@@ -739,6 +810,27 @@ pub unsafe extern "C" fn send(fd: c_int, buf: *const c_void, len: size_t, flags:
         }
     };
     overlay_send(fd, plaintext, flags)
+}
+
+#[no_mangle]
+/// Interposes libc `sendto(2)`.
+///
+/// # Safety
+/// Raw pointers must satisfy libc `sendto`'s contract. Stream sockets are
+/// fail-closed because `sendto` cannot preserve overlay framing/encryption
+/// semantics.
+pub unsafe extern "C" fn sendto(
+    fd: c_int,
+    buf: *const c_void,
+    len: size_t,
+    flags: c_int,
+    addr: *const libc::sockaddr,
+    addrlen: libc::socklen_t,
+) -> ssize_t {
+    if block_stream_egress(fd) {
+        return -1;
+    }
+    (real().sendto)(fd, buf, len, flags, addr, addrlen)
 }
 
 #[no_mangle]
@@ -838,6 +930,26 @@ pub unsafe extern "C" fn sendmsg(fd: c_int, msg: *const msghdr, flags: c_int) ->
     overlay_write_iov(fd, msg_ref.msg_iov, msg_ref.msg_iovlen as usize, flags)
 }
 
+#[cfg(target_os = "linux")]
+#[no_mangle]
+/// Interposes libc `sendmmsg(2)`.
+///
+/// # Safety
+/// `msgvec` must satisfy libc `sendmmsg`'s contract. Stream sockets are
+/// fail-closed because batched datagram send cannot safely carry overlay
+/// records.
+pub unsafe extern "C" fn sendmmsg(
+    fd: c_int,
+    msgvec: *mut libc::mmsghdr,
+    vlen: c_uint,
+    flags: c_int,
+) -> c_int {
+    if block_stream_egress(fd) {
+        return -1;
+    }
+    (real().sendmmsg)(fd, msgvec, vlen, flags)
+}
+
 #[no_mangle]
 /// Interposes libc `recvmsg(2)`.
 ///
@@ -856,6 +968,66 @@ pub unsafe extern "C" fn recvmsg(fd: c_int, msg: *mut msghdr, flags: c_int) -> s
     msg_ref.msg_flags = 0;
     msg_ref.msg_controllen = 0;
     overlay_read_iov(fd, msg_ref.msg_iov, msg_ref.msg_iovlen as usize, flags)
+}
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+/// Interposes libc `sendfile(2)`.
+///
+/// # Safety
+/// Follows libc `sendfile`'s fd and pointer contract. A stream `out_fd` is
+/// fail-closed because zero-copy plaintext cannot be transformed into overlay
+/// records without changing the syscall semantics.
+pub unsafe extern "C" fn sendfile(
+    out_fd: c_int,
+    in_fd: c_int,
+    offset: *mut libc::off_t,
+    count: size_t,
+) -> ssize_t {
+    if block_stream_egress(out_fd) {
+        return -1;
+    }
+    (real().sendfile)(out_fd, in_fd, offset, count)
+}
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+/// Interposes libc `sendfile64(2)`.
+///
+/// # Safety
+/// Follows libc `sendfile64`'s fd and pointer contract. A stream `out_fd` is
+/// fail-closed for the same reason as `sendfile`.
+pub unsafe extern "C" fn sendfile64(
+    out_fd: c_int,
+    in_fd: c_int,
+    offset: *mut libc::off64_t,
+    count: size_t,
+) -> ssize_t {
+    if block_stream_egress(out_fd) {
+        return -1;
+    }
+    (real().sendfile64)(out_fd, in_fd, offset, count)
+}
+
+#[cfg(target_os = "linux")]
+#[no_mangle]
+/// Interposes libc `splice(2)`.
+///
+/// # Safety
+/// Follows libc `splice`'s fd and pointer contract. Any stream socket endpoint
+/// is fail-closed so plaintext cannot bypass overlay framing.
+pub unsafe extern "C" fn splice(
+    fd_in: c_int,
+    off_in: *mut libc::loff_t,
+    fd_out: c_int,
+    off_out: *mut libc::loff_t,
+    len: size_t,
+    flags: c_uint,
+) -> ssize_t {
+    if block_stream_egress(fd_in) || block_stream_egress(fd_out) {
+        return -1;
+    }
+    (real().splice)(fd_in, off_in, fd_out, off_out, len, flags)
 }
 
 #[no_mangle]

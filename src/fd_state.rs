@@ -5,6 +5,7 @@
 //! established session are trait objects, so the active cipher suite is dynamic.
 
 use crate::crypto::{CipherSuite, InitiatorState, SessionKeys};
+use libc::c_int;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,10 @@ pub enum FdPhase {
 /// All mutable state for one socket fd.
 pub struct FdState {
     pub phase: FdPhase,
+    /// Process that established or adopted this fd state. After `fork()`, the
+    /// child inherits this value but has a different live PID, so inherited
+    /// sessions can fail closed before any duplicated nonce counter is used.
+    pub owner_pid: c_int,
     /// Suite this process is configured to use (policy-pinned at startup).
     pub policy_suite: CipherSuite,
     /// Bytes framed and waiting to go out on the real socket.
@@ -49,6 +54,7 @@ impl FdState {
     pub fn responder(policy_suite: CipherSuite) -> Self {
         Self {
             phase: FdPhase::ResponderAwaitingClientHello,
+            owner_pid: current_pid(),
             policy_suite,
             tx_backlog: Vec::new(),
             rx_wire: Vec::new(),
@@ -63,6 +69,7 @@ impl FdState {
     ) -> Self {
         Self {
             phase: FdPhase::InitiatorAwaitingServerHello(state),
+            owner_pid: current_pid(),
             policy_suite,
             tx_backlog: client_hello_frame,
             rx_wire: Vec::new(),
@@ -73,6 +80,7 @@ impl FdState {
     pub fn failed(policy_suite: CipherSuite) -> Self {
         Self {
             phase: FdPhase::Failed,
+            owner_pid: current_pid(),
             policy_suite,
             tx_backlog: Vec::new(),
             rx_wire: Vec::new(),
@@ -91,6 +99,10 @@ impl FdState {
     pub fn append_rx_plain(&mut self, bytes: &[u8]) -> Result<(), BufferError> {
         append_bounded(&mut self.rx_plain, bytes, MAX_PLAIN_RX_BUFFER)
     }
+}
+
+pub fn current_pid() -> c_int {
+    unsafe { libc::getpid() }
 }
 
 impl Drop for FdState {

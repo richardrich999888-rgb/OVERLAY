@@ -1,3 +1,4 @@
 target/
 files.zip
 files_unzipped/
+tests/__pycache__/
