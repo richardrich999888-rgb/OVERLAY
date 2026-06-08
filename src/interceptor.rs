@@ -6,10 +6,13 @@
 //! can move. If policy or identity material is missing, the fd is tracked as
 //! failed so later I/O returns an error instead of leaking plaintext.
 
+use crate::crypto::fallback::{self, FallbackInitiator};
 use crate::crypto::{self, CipherSuite};
 use crate::fd_state::{
-    current_pid, record_blocked_bypass_attempt, FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY,
+    current_pid, record_blocked_bypass_attempt, record_downgrade_attack,
+    record_fallback_activation, FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY,
 };
+use crate::kernel_native::{select_posture, AvailabilityPosture};
 #[cfg(target_os = "linux")]
 use libc::c_uint;
 use libc::{c_int, c_void, iovec, msghdr, size_t, ssize_t};
@@ -24,6 +27,10 @@ const HDR_LEN: usize = 4;
 const TYPE_CLIENT_HELLO: u8 = 1;
 const TYPE_SERVER_HELLO: u8 = 2;
 const TYPE_DATA: u8 = 3;
+const TYPE_FALLBACK_HELLO: u8 = 4;
+const TYPE_FALLBACK_FINISHED: u8 = 5;
+/// Wire suite-id marker carried by fallback frames (not a NIST suite).
+const FALLBACK_WIRE_ID: u8 = 0xFE;
 const MAX_FRAME_BODY: usize = MAX_WIRE_RX_BUFFER - HDR_LEN;
 const MAX_RECORD_PLAINTEXT: usize = 64 * 1024;
 const MAX_IOV_COPY: usize = 16 * 1024 * 1024;
@@ -312,6 +319,16 @@ fn queue_frame(st: &mut FdState, suite_id: u8, tag: u8, payload: &[u8]) -> Resul
     res
 }
 
+/// Local availability posture for this process. Computed from a *local*
+/// degradation signal and PSK configuration — never from the wire — so an MITM
+/// cannot push a healthy node into fallback.
+fn local_posture() -> AvailabilityPosture {
+    select_posture(
+        crypto::pqc_control_available(),
+        crypto::resolve_fallback_psk().is_some(),
+    )
+}
+
 fn drive_handshake(st: &mut FdState) {
     loop {
         let f = match try_pop_frame(&mut st.rx_wire) {
@@ -351,6 +368,43 @@ fn drive_handshake(st: &mut FdState) {
                     _ => st.fail_closed(),
                 }
             }
+            (FdPhase::ResponderAwaitingClientHello, TYPE_FALLBACK_HELLO) => {
+                // A peer is asking to use the PSK fallback. Accept ONLY if our own
+                // local posture is also degraded; a healthy FullPqc responder that
+                // is asked to fall back is witnessing a downgrade attempt.
+                match (local_posture(), crypto::resolve_fallback_psk()) {
+                    (AvailabilityPosture::EncryptedFallback, Some(psk)) => {
+                        match fallback::respond(&psk, &f.payload) {
+                            Ok((keys, finished)) => {
+                                if queue_frame(
+                                    st,
+                                    FALLBACK_WIRE_ID,
+                                    TYPE_FALLBACK_FINISHED,
+                                    &finished,
+                                )
+                                .is_ok()
+                                {
+                                    record_fallback_activation();
+                                    st.activate(keys);
+                                } else {
+                                    st.fail_closed();
+                                }
+                            }
+                            // Malformed/garbage fallback hello: treat as tamper.
+                            Err(_) => {
+                                record_downgrade_attack("malformed FallbackHello at responder");
+                                st.fail_closed();
+                            }
+                        }
+                    }
+                    _ => {
+                        record_downgrade_attack(
+                            "FallbackHello received by a non-degraded responder",
+                        );
+                        st.fail_closed();
+                    }
+                }
+            }
             (FdPhase::InitiatorAwaitingServerHello(state), TYPE_SERVER_HELLO) => {
                 match crypto::resolve_identity() {
                     Ok(identity) if f.suite_id == st.policy_suite.id() => {
@@ -361,6 +415,28 @@ fn drive_handshake(st: &mut FdState) {
                     }
                     _ => st.fail_closed(),
                 }
+            }
+            (FdPhase::InitiatorAwaitingFallbackFinished(state), TYPE_FALLBACK_FINISHED) => {
+                match state.finish(&f.payload) {
+                    Ok(keys) => {
+                        record_fallback_activation();
+                        st.activate(keys);
+                    }
+                    // A failed AEAD confirm means a wrong PSK or active tampering.
+                    Err(_) => {
+                        record_downgrade_attack("FallbackFinished failed PSK authentication");
+                        st.fail_closed();
+                    }
+                }
+            }
+            // A FullPqc node that receives a fallback frame mid-PQC, or any other
+            // unexpected (phase, type) pair, is a downgrade/tamper attempt.
+            (FdPhase::InitiatorAwaitingServerHello(_), TYPE_FALLBACK_HELLO)
+            | (FdPhase::InitiatorAwaitingServerHello(_), TYPE_FALLBACK_FINISHED)
+            | (FdPhase::InitiatorAwaitingFallbackFinished(_), TYPE_CLIENT_HELLO)
+            | (FdPhase::InitiatorAwaitingFallbackFinished(_), TYPE_SERVER_HELLO) => {
+                record_downgrade_attack("unexpected handshake frame type for current phase");
+                st.fail_closed();
             }
             _ => st.fail_closed(),
         }
@@ -414,24 +490,46 @@ unsafe fn ensure_tracked(fd: c_int) -> bool {
 
 unsafe fn install_initiator_state(fd: c_int) {
     let suite_for_failure = failed_policy_suite();
-    // All crypto runs before the global lock is taken; no I/O under the lock.
-    let state = match (policy(), crypto::resolve_identity()) {
-        (Ok(suite), Ok(identity)) => {
-            let engine = suite.engine();
-            match engine.begin_initiator(&identity) {
-                Ok((state, hello_body)) => {
-                    match frame(suite.id(), TYPE_CLIENT_HELLO, &hello_body) {
-                        Ok(f) => FdState::initiator(suite, state, f),
-                        Err(()) => FdState::failed(suite),
-                    }
-                }
-                Err(_) => FdState::failed(suite),
-            }
-        }
-        _ => FdState::failed(suite_for_failure),
+    // All crypto runs before the global lock is taken; no I/O under the lock. The
+    // posture is a LOCAL decision (degradation signal + PSK), never wire-driven.
+    let state = match policy() {
+        Ok(suite) => match local_posture() {
+            AvailabilityPosture::FullPqc => build_pqc_initiator(suite),
+            AvailabilityPosture::EncryptedFallback => build_fallback_initiator(suite),
+            AvailabilityPosture::FailClosed => FdState::failed(suite),
+        },
+        Err(()) => FdState::failed(suite_for_failure),
     };
     let mut reg = lock_registry();
     reg.insert(fd, Arc::new(Mutex::new(state)));
+}
+
+/// Build a FullPqc initiator (the healthy path).
+fn build_pqc_initiator(suite: CipherSuite) -> FdState {
+    let Ok(identity) = crypto::resolve_identity() else {
+        return FdState::failed(suite);
+    };
+    let engine = suite.engine();
+    match engine.begin_initiator(&identity) {
+        Ok((state, hello_body)) => match frame(suite.id(), TYPE_CLIENT_HELLO, &hello_body) {
+            Ok(f) => FdState::initiator(suite, state, f),
+            Err(()) => FdState::failed(suite),
+        },
+        Err(_) => FdState::failed(suite),
+    }
+}
+
+/// Build a degraded-posture initiator that proposes the authenticated PSK
+/// fallback. Only reached when local posture is `EncryptedFallback` (PSK present).
+fn build_fallback_initiator(suite: CipherSuite) -> FdState {
+    let Some(psk) = crypto::resolve_fallback_psk() else {
+        return FdState::failed(suite);
+    };
+    let (state, hello) = FallbackInitiator::begin(psk);
+    match frame(FALLBACK_WIRE_ID, TYPE_FALLBACK_HELLO, &hello) {
+        Ok(f) => FdState::fallback_initiator(suite, state, f),
+        Err(()) => FdState::failed(suite),
+    }
 }
 
 unsafe fn drive_until_active_for_write(
@@ -1273,5 +1371,38 @@ mod crash_isolation_tests {
             st.lock().is_err(),
             "poisoned per-fd lock must be observable so I/O fails closed"
         );
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    //! Downgrade resistance: a healthy `FullPqc` node must reject a fallback
+    //! frame on the wire (an MITM cannot push it into PSK mode). These tests rely
+    //! on the default (non-degraded) posture; no test sets `SYNTRIASS_PQC_DEGRADED`.
+    use super::*;
+    use crate::crypto::CipherSuite;
+
+    #[test]
+    fn fullpqc_responder_rejects_fallback_hello_as_downgrade() {
+        assert_eq!(local_posture(), AvailabilityPosture::FullPqc);
+        let mut st = FdState::responder(CipherSuite::NistStandard768);
+        let hello = vec![0u8; crate::crypto::FALLBACK_NONCE_LEN];
+        let f = frame(FALLBACK_WIRE_ID, TYPE_FALLBACK_HELLO, &hello).unwrap();
+        st.rx_wire.extend_from_slice(&f);
+        drive_handshake(&mut st);
+        assert!(
+            matches!(st.phase, FdPhase::Failed),
+            "a healthy FullPqc responder must fail closed on a FallbackHello"
+        );
+    }
+
+    #[test]
+    fn responder_rejects_fallback_finished_out_of_phase() {
+        // A responder should never receive a FallbackFinished first.
+        let mut st = FdState::responder(CipherSuite::NistStandard768);
+        let f = frame(FALLBACK_WIRE_ID, TYPE_FALLBACK_FINISHED, &[0u8; 64]).unwrap();
+        st.rx_wire.extend_from_slice(&f);
+        drive_handshake(&mut st);
+        assert!(matches!(st.phase, FdPhase::Failed));
     }
 }

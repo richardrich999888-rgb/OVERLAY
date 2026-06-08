@@ -6,6 +6,7 @@
 
 #[cfg(target_os = "linux")]
 use crate::crypto;
+use crate::crypto::fallback::FallbackInitiator;
 use crate::crypto::{CipherSuite, InitiatorState, SessionKeys};
 use libc::c_int;
 use once_cell::sync::Lazy;
@@ -44,6 +45,8 @@ struct RuntimeMetrics {
     handshake_latency: Histogram,
     blocked_bypass_attempts: IntCounter,
     config_epoch_reloads: IntCounter,
+    fallback_activations: IntCounter,
+    downgrade_attacks_detected: IntCounter,
 }
 
 static RUNTIME_METRICS: Lazy<RuntimeMetrics> = Lazy::new(|| {
@@ -73,6 +76,16 @@ static RUNTIME_METRICS: Lazy<RuntimeMetrics> = Lazy::new(|| {
         "Successful cryptographic configuration epoch reloads.",
     )
     .expect("static Prometheus counter definition is valid");
+    let fallback_activations = IntCounter::new(
+        "syntriass_fallback_activations_total",
+        "Authenticated PSK EncryptedFallback sessions established (degraded mode).",
+    )
+    .expect("static Prometheus counter definition is valid");
+    let downgrade_attacks_detected = IntCounter::new(
+        "syntriass_downgrade_attacks_detected_total",
+        "Detected downgrade/tamper attempts on the negotiation path (fail-closed).",
+    )
+    .expect("static Prometheus counter definition is valid");
 
     registry
         .register(Box::new(active_sessions.clone()))
@@ -86,6 +99,12 @@ static RUNTIME_METRICS: Lazy<RuntimeMetrics> = Lazy::new(|| {
     registry
         .register(Box::new(config_epoch_reloads.clone()))
         .expect("config reload metric registration is unique");
+    registry
+        .register(Box::new(fallback_activations.clone()))
+        .expect("fallback activations metric registration is unique");
+    registry
+        .register(Box::new(downgrade_attacks_detected.clone()))
+        .expect("downgrade attacks metric registration is unique");
 
     RuntimeMetrics {
         registry,
@@ -93,6 +112,8 @@ static RUNTIME_METRICS: Lazy<RuntimeMetrics> = Lazy::new(|| {
         handshake_latency,
         blocked_bypass_attempts,
         config_epoch_reloads,
+        fallback_activations,
+        downgrade_attacks_detected,
     }
 });
 
@@ -106,7 +127,10 @@ pub enum FdPhase {
     /// connect(2) succeeded; we are the initiator. We hold the boxed initiator
     /// state for the suite we proposed until ServerHello arrives.
     InitiatorAwaitingServerHello(Box<dyn InitiatorState>),
-    /// We accepted on this fd and expect a ClientHello first.
+    /// Degraded posture: we sent a FallbackHello and await FallbackFinished.
+    InitiatorAwaitingFallbackFinished(FallbackInitiator),
+    /// We accepted on this fd and expect a ClientHello (or, if our own posture is
+    /// degraded, a FallbackHello) first.
     ResponderAwaitingClientHello,
     /// Key agreement complete; application data flows encrypted.
     Active(SessionKeys),
@@ -161,6 +185,26 @@ impl FdState {
             policy_suite,
             config_epoch: current_config_epoch(),
             tx_backlog: client_hello_frame,
+            rx_wire: Vec::new(),
+            rx_plain: Vec::new(),
+            handshake_started: Some(Instant::now()),
+            counted_active: false,
+        }
+    }
+
+    /// Degraded-posture initiator: we sent a FallbackHello and hold the fallback
+    /// state until the authenticated FallbackFinished arrives.
+    pub fn fallback_initiator(
+        policy_suite: CipherSuite,
+        state: FallbackInitiator,
+        fallback_hello_frame: Vec<u8>,
+    ) -> Self {
+        Self {
+            phase: FdPhase::InitiatorAwaitingFallbackFinished(state),
+            owner_pid: current_pid(),
+            policy_suite,
+            config_epoch: current_config_epoch(),
+            tx_backlog: fallback_hello_frame,
             rx_wire: Vec::new(),
             rx_plain: Vec::new(),
             handshake_started: Some(Instant::now()),
@@ -252,6 +296,18 @@ pub fn record_blocked_bypass_attempt() {
 
 pub fn record_config_epoch_reload() {
     RUNTIME_METRICS.config_epoch_reloads.inc();
+}
+
+/// An authenticated PSK fallback session was established (degraded mode).
+pub fn record_fallback_activation() {
+    RUNTIME_METRICS.fallback_activations.inc();
+}
+
+/// A downgrade / tamper attempt was detected on the negotiation path. Increments
+/// the :9090 counter and logs a high-severity line; the caller then fails closed.
+pub fn record_downgrade_attack(detail: &str) {
+    RUNTIME_METRICS.downgrade_attacks_detected.inc();
+    eprintln!("syntriass: SECURITY ALERT: downgrade attempt detected: {detail} (failing closed)");
 }
 
 pub fn render_prometheus_metrics() -> Result<String, prometheus::Error> {

@@ -11,6 +11,7 @@
 //!   * `nist768`  - X25519 + ML-KEM-768  (suite id 0x01).
 //!   * `nist1024` - X25519 + ML-KEM-1024 (suite id 0x02).
 
+pub mod fallback;
 mod generic;
 pub mod nist1024;
 pub mod nist768;
@@ -451,6 +452,23 @@ pub fn derive_fallback_session(
 pub fn resolve_fallback_psk() -> Option<[u8; FALLBACK_PSK_LEN]> {
     let token = std::env::var("SYNTRIASS_FALLBACK_PSK_HEX").ok()?;
     decode_hex_exact::<FALLBACK_PSK_LEN>(&token).ok()
+}
+
+/// Whether the asymmetric (PQC) control path is currently healthy.
+///
+/// This is a *local* signal — it is read from local configuration, never from
+/// the wire — which is what makes the fallback decision downgrade-resistant: an
+/// on-path attacker cannot flip it to force a healthy node into fallback. A v2
+/// deployment wires this to the daemon heartbeat; here it is driven by
+/// `SYNTRIASS_PQC_DEGRADED` (truthy => degraded) so the path is testable.
+pub fn pqc_control_available() -> bool {
+    match std::env::var("SYNTRIASS_PQC_DEGRADED") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "1" || v == "true" || v == "yes" || v == "on")
+        }
+        Err(_) => true,
+    }
 }
 
 fn read_identity_config_from_sources() -> Result<CachedIdentityConfig, CryptoError> {
