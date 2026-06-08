@@ -1,3 +1,79 @@
+# Syntriass Overlay: Enterprise & Sovereign PQC Runtime Fabric
+
+> **Executive briefing for CISOs, venture investors, and regulators:** Syntriass
+> Overlay is a drop-in software layer for upgrading legacy banking, defence, and
+> critical-infrastructure TCP applications toward post-quantum-ready transport
+> protection without changing application source code.
+
+Syntriass is designed for organizations that need crypto-agility now: the
+ability to introduce, test, and change cryptographic protection around existing
+systems without waiting for multi-year rewrite cycles.
+
+## For RBI, Q-SAFE-Oriented Reviews, and Financial Regulators
+
+The RBI's Q-SAFE direction highlights the need for financial institutions to
+understand cryptographic inventory, assess crypto-agility, and identify critical
+systems exposed to quantum-era threats. Syntriass maps directly to that
+operational problem: it gives teams a runtime control that can introduce
+NIST-aligned hybrid cryptography around selected legacy TCP workflows while the
+underlying application remains unchanged.
+
+- **Crypto-agility by policy:** switching from `nist768` to `nist1024` is a
+  configuration change in `SYNTRIASS_SUITE` or `/etc/syntriass/policy.toml`,
+  not an application rewrite.
+- **CBOM-friendly evidence:** the implementation names exact primitives,
+  versions, suite IDs, hook surfaces, and verification harnesses so reviewers can
+  map what cryptography is used and where.
+- **Fail-closed audit posture:** missing identity material, unauthenticated
+  peers, tampered records, policy mismatch, and unsupported stream-socket egress
+  paths produce failure rather than plaintext fallback.
+
+Syntriass is not a regulatory certification by itself. It is an engineering
+control that can support crypto-agility demonstrations, pilot programs, and
+technical evidence packs for quantum-safe readiness reviews.
+
+## For Bank C-Suites and CISOs
+
+Manually refactoring core legacy codebases to add quantum-safe transport
+security can consume years of specialist engineering time and create operational
+downtime risk. Syntriass reduces that integration friction by moving protection
+to the process runtime layer.
+
+- **Zero-touch application integration:** deploy with `LD_PRELOAD`; the
+  protected application binary and source code remain unchanged.
+- **Operational continuity:** the app continues to use normal socket and
+  file-descriptor APIs while the overlay transforms wire traffic into
+  authenticated encrypted records.
+- **Active enforcement:** this is not passive monitoring. If a peer is
+  untrusted, a frame is malformed, a record is tampered, or a bypass syscall is
+  used on a protected stream socket, Syntriass fails closed.
+- **Measurable outcome:** the verification harness captures real wire bytes and
+  proves that protected application markers are absent from overlay traffic.
+
+## For Venture Capital and Strategic Buyers
+
+Post-quantum migration creates a software modernization gap: enterprises must
+prepare for quantum-era cryptographic risk faster than they can rewrite every
+legacy application. Syntriass targets that gap with a software-only runtime
+fabric that can be licensed, deployed, tested, and expanded across controlled
+fleets.
+
+- **Friction arbitrage:** customers avoid immediate full rewrites while still
+  creating a concrete quantum-safe migration path for selected high-value TCP
+  workflows.
+- **High-leverage deployment model:** Rust implementation, process-local
+  loading, policy-pinned suites, and deterministic verification harnesses reduce
+  the amount of bespoke consulting needed for each pilot.
+- **Enterprise expansion path:** start with controlled enclaves or legacy
+  service pairs, then expand to broader secure transport overlays as operators
+  validate identity provisioning, observability, and runtime compatibility.
+
+The commercial value is not "encryption as a feature." It is reducing the time,
+cost, and operational disruption required to move legacy systems toward
+identity-bound, post-quantum-hybrid transport protection.
+
+---
+
 # Syntriass Overlay
 
 Syntriass Overlay is a defence-oriented runtime encryption layer for protecting
