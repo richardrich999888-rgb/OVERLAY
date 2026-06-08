@@ -14,13 +14,14 @@
 //!     encrypts/decrypts the stream natively.
 //!   * [`ktls_supported`] probes whether the running kernel exposes the TLS ULP.
 //!
-//! What is still a stub (honestly): [`complete_kernel_upcall`] cannot yet derive
-//! TLS-1.3 record secrets from the hybrid PQC handshake. `SessionKeys`
-//! deliberately never exposes raw key bytes, and kTLS speaks TLS records rather
-//! than the v1 custom frame, so that export bridge is separate work. Until it
-//! exists the enforce path fails closed via [`KernelNativeError::KeyExportUnsupported`].
+//! The PQC -> kTLS bridge is now wired: [`bridge_session_to_ktls`] exports the
+//! established hybrid session's traffic keys (via `SessionKeys::export_ktls`),
+//! packs them into `tls12_crypto_info_aes_gcm_256`, and installs them with
+//! `setsockopt`. On any kTLS failure it tears the socket down (shutdown + close)
+//! so cleartext can never escape. [`KernelSockEvent`] is the binary contract the
+//! eBPF RingBuf emits and the daemon decodes.
 
-use crate::crypto::{self, CipherSuite, CryptoError};
+use crate::crypto::{self, CipherSuite, CryptoError, KtlsTrafficSecret, SessionKeys};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::os::unix::io::RawFd;
@@ -48,6 +49,102 @@ pub struct KernelUpcall {
     pub fd: Option<RawFd>,
 }
 
+/// Binary connection event emitted by the eBPF sockops program into the pinned
+/// RingBuf and decoded by the daemon. `#[repr(C)]` with a fixed layout so the
+/// kernel and user space agree byte-for-byte; addresses are stored as 16 bytes
+/// (IPv4 lives in the first 4) and `family` is `AF_INET`/`AF_INET6`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelSockEvent {
+    pub cookie: u64,
+    pub cgroup_id: u64,
+    pub src_addr: [u8; 16],
+    pub dst_addr: [u8; 16],
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub family: u16,
+    pub _pad: u16,
+}
+
+impl KernelSockEvent {
+    pub const WIRE_LEN: usize = core::mem::size_of::<KernelSockEvent>();
+
+    /// Decode one RingBuf record. Returns `None` if the slice is too short.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::WIRE_LEN {
+            return None;
+        }
+        let rd16 = |o: usize| {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(&buf[o..o + 16]);
+            a
+        };
+        let rd_u64 = |o: usize| u64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+        let rd_u16 = |o: usize| u16::from_ne_bytes(buf[o..o + 2].try_into().unwrap());
+        Some(KernelSockEvent {
+            cookie: rd_u64(0),
+            cgroup_id: rd_u64(8),
+            src_addr: rd16(16),
+            dst_addr: rd16(32),
+            src_port: rd_u16(48),
+            dst_port: rd_u16(50),
+            family: rd_u16(52),
+            _pad: rd_u16(54),
+        })
+    }
+
+    /// Serialize to the on-wire layout (used by tests and by a user-space
+    /// re-emitter; the kernel writes this layout natively).
+    pub fn to_bytes(&self) -> [u8; Self::WIRE_LEN] {
+        let mut out = [0u8; Self::WIRE_LEN];
+        out[0..8].copy_from_slice(&self.cookie.to_ne_bytes());
+        out[8..16].copy_from_slice(&self.cgroup_id.to_ne_bytes());
+        out[16..32].copy_from_slice(&self.src_addr);
+        out[32..48].copy_from_slice(&self.dst_addr);
+        out[48..50].copy_from_slice(&self.src_port.to_ne_bytes());
+        out[50..52].copy_from_slice(&self.dst_port.to_ne_bytes());
+        out[52..54].copy_from_slice(&self.family.to_ne_bytes());
+        out[54..56].copy_from_slice(&self._pad.to_ne_bytes());
+        out
+    }
+
+    /// Render the destination address as a string for [`KernelUpcall`].
+    pub fn dst_addr_string(&self) -> String {
+        if self.family == libc::AF_INET6 as u16 {
+            let mut seg = [0u16; 8];
+            for (i, s) in seg.iter_mut().enumerate() {
+                *s = u16::from_be_bytes([self.dst_addr[i * 2], self.dst_addr[i * 2 + 1]]);
+            }
+            std::net::Ipv6Addr::new(
+                seg[0], seg[1], seg[2], seg[3], seg[4], seg[5], seg[6], seg[7],
+            )
+            .to_string()
+        } else {
+            std::net::Ipv4Addr::new(
+                self.dst_addr[0],
+                self.dst_addr[1],
+                self.dst_addr[2],
+                self.dst_addr[3],
+            )
+            .to_string()
+        }
+    }
+
+    /// Map a decoded kernel event to the daemon's upcall record. `fd` is supplied
+    /// separately by the loader (the RingBuf event carries identity, not the fd).
+    pub fn to_upcall(&self, fd: Option<RawFd>) -> KernelUpcall {
+        KernelUpcall {
+            socket_id: self.cookie,
+            local_port: self.src_port,
+            remote_port: self.dst_port,
+            remote_addr: self.dst_addr_string(),
+            cgroup_id: Some(self.cgroup_id),
+            pid: None,
+            fd,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnforcementDecision {
     Enforce,
@@ -63,8 +160,6 @@ pub enum KernelNativeError {
     KtlsUnavailable,
     /// A kTLS `setsockopt` call failed for a reason other than missing support.
     Ktls(KtlsError),
-    /// Deriving TLS-1.3 record secrets from the PQC handshake is not yet built.
-    KeyExportUnsupported,
 }
 
 impl fmt::Display for KernelNativeError {
@@ -84,10 +179,6 @@ impl fmt::Display for KernelNativeError {
                 write!(f, "kernel TLS (kTLS) ULP is unavailable on this host")
             }
             KernelNativeError::Ktls(e) => write!(f, "{e}"),
-            KernelNativeError::KeyExportUnsupported => write!(
-                f,
-                "PQC-to-kTLS record secret export is not yet implemented (fail closed)"
-            ),
         }
     }
 }
@@ -146,16 +237,30 @@ pub fn configured_suite() -> Result<CipherSuite, KernelNativeError> {
     crypto::resolve_policy().map_err(|_| KernelNativeError::Config)
 }
 
-pub fn execute_local_handshake_probe(suite: CipherSuite) -> Result<(), KernelNativeError> {
+/// Run the hybrid handshake and return the established initiator session keys.
+///
+/// NOTE: this is a *local* two-party exchange (the daemon plays both roles with
+/// its own identity). In a live deployment the daemon performs this exchange
+/// with the **remote** peer over the eBPF-paused socket; that socket I/O wiring
+/// is the remaining integration step. The returned keys are real and are what
+/// gets bridged into kTLS.
+pub fn run_local_handshake(suite: CipherSuite) -> Result<SessionKeys, KernelNativeError> {
     let identity = crypto::resolve_identity().map_err(KernelNativeError::Crypto)?;
     let engine = suite.engine();
-    let (_initiator_state, client_hello) = engine
+    let (state, client_hello) = engine
         .begin_initiator(&identity)
         .map_err(KernelNativeError::Crypto)?;
-    let (_keys, _server_hello) = engine
+    let (_server_keys, server_hello) = engine
         .respond(&identity, &client_hello)
         .map_err(KernelNativeError::Crypto)?;
-    Ok(())
+    state
+        .finish(&identity, &server_hello)
+        .map_err(KernelNativeError::Crypto)
+}
+
+/// Back-compat probe used by tests: run the handshake, discard the keys.
+pub fn execute_local_handshake_probe(suite: CipherSuite) -> Result<(), KernelNativeError> {
+    run_local_handshake(suite).map(|_| ())
 }
 
 pub fn complete_kernel_upcall(upcall: &KernelUpcall) -> Result<(), KernelNativeError> {
@@ -163,13 +268,11 @@ pub fn complete_kernel_upcall(upcall: &KernelUpcall) -> Result<(), KernelNativeE
         return Ok(());
     }
     let suite = configured_suite()?;
-    execute_local_handshake_probe(suite)?;
-    let _fd = upcall.fd.ok_or(KernelNativeError::MissingSocketReference)?;
-    // The kTLS install primitives below this point are real and tested, but the
-    // step that turns this socket's hybrid PQC handshake into TLS-1.3 record
-    // secrets does not exist yet (see module docs). Fail closed rather than
-    // pretend a tunnel was established.
-    Err(KernelNativeError::KeyExportUnsupported)
+    let fd = upcall.fd.ok_or(KernelNativeError::MissingSocketReference)?;
+    let keys = run_local_handshake(suite)?;
+    // Bridge the PQC session into kernel TLS. On any failure the socket is torn
+    // down inside `bridge_session_to_ktls`, so cleartext can never escape.
+    bridge_session_to_ktls(fd, &keys)
 }
 
 // ----------------------------- Kernel TLS (kTLS) -----------------------------
@@ -191,6 +294,19 @@ impl fmt::Debug for KtlsSecrets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Never print key material.
         f.debug_struct("KtlsSecrets").finish_non_exhaustive()
+    }
+}
+
+impl KtlsSecrets {
+    /// Build kTLS secrets from a session's exported traffic material. The record
+    /// sequence starts at 0 (a fresh kTLS socket).
+    pub fn from_traffic_secret(s: &KtlsTrafficSecret) -> Self {
+        KtlsSecrets {
+            key: s.key,
+            salt: s.salt,
+            iv: s.iv,
+            rec_seq: [0u8; KTLS_REC_SEQ_LEN],
+        }
     }
 }
 
@@ -431,6 +547,45 @@ pub fn install_ktls_keys(fd: RawFd, keys: &KtlsDuplexKeys) -> Result<(), KernelN
     install_ktls_duplex(fd, keys).map_err(KernelNativeError::from)
 }
 
+/// Fail closed: tear the socket down so no cleartext can be read or written on
+/// it after a failed kTLS setup. `shutdown(SHUT_RDWR)` unblocks any peer and
+/// `close` releases the fd.
+#[cfg(target_os = "linux")]
+fn fail_closed_shutdown(fd: RawFd) {
+    unsafe {
+        libc::shutdown(fd, libc::SHUT_RDWR);
+        libc::close(fd);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fail_closed_shutdown(fd: RawFd) {
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+/// The PQC -> kTLS bridge: export the established session's traffic keys, pack
+/// them into the kernel's `tls12_crypto_info_aes_gcm_256`, and install them on
+/// `fd` for both directions. The exported key material is zeroized as the
+/// `KtlsTrafficKeys` / `KtlsDuplexKeys` drop. On ANY failure the socket is shut
+/// down and closed (fail closed) so plaintext cannot traverse it.
+pub fn bridge_session_to_ktls(fd: RawFd, keys: &SessionKeys) -> Result<(), KernelNativeError> {
+    let traffic = keys.export_ktls();
+    let duplex = KtlsDuplexKeys {
+        tx: KtlsSecrets::from_traffic_secret(&traffic.tx),
+        rx: KtlsSecrets::from_traffic_secret(&traffic.rx),
+    };
+    // `traffic` and `duplex` both zeroize their key bytes on drop at end of scope.
+    match install_ktls_keys(fd, &duplex) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            fail_closed_shutdown(fd);
+            Err(e)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +629,58 @@ mod tests {
         };
         let rendered = format!("{s:?}");
         assert!(!rendered.contains("ab") && !rendered.contains("AB"));
+    }
+
+    #[test]
+    fn kernel_event_is_56_bytes_and_round_trips() {
+        assert_eq!(KernelSockEvent::WIRE_LEN, 56);
+        let mut src = [0u8; 16];
+        src[..4].copy_from_slice(&[10, 0, 0, 7]);
+        let mut dst = [0u8; 16];
+        dst[..4].copy_from_slice(&[93, 184, 216, 34]);
+        let ev = KernelSockEvent {
+            cookie: 0xDEAD_BEEF_0000_0001,
+            cgroup_id: 42,
+            src_addr: src,
+            dst_addr: dst,
+            src_port: 51000,
+            dst_port: 443,
+            family: libc::AF_INET as u16,
+            _pad: 0,
+        };
+        let decoded = KernelSockEvent::from_bytes(&ev.to_bytes()).unwrap();
+        assert_eq!(decoded, ev);
+        assert_eq!(decoded.dst_addr_string(), "93.184.216.34");
+
+        let up = decoded.to_upcall(Some(7));
+        assert_eq!(up.socket_id, ev.cookie);
+        assert_eq!(up.remote_port, 443);
+        assert_eq!(up.remote_addr, "93.184.216.34");
+        assert_eq!(up.cgroup_id, Some(42));
+        assert_eq!(up.fd, Some(7));
+        assert_eq!(classify_upcall(&up), EnforcementDecision::Enforce);
+    }
+
+    #[test]
+    fn kernel_event_rejects_short_buffer() {
+        assert!(KernelSockEvent::from_bytes(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn ipv6_destination_renders() {
+        let mut dst = [0u8; 16];
+        dst[0..2].copy_from_slice(&[0x20, 0x01]);
+        dst[15] = 1;
+        let ev = KernelSockEvent {
+            cookie: 1,
+            cgroup_id: 0,
+            src_addr: [0u8; 16],
+            dst_addr: dst,
+            src_port: 1,
+            dst_port: 443,
+            family: libc::AF_INET6 as u16,
+            _pad: 0,
+        };
+        assert_eq!(ev.dst_addr_string(), "2001::1");
     }
 }

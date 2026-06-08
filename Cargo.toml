@@ -51,6 +51,8 @@ prometheus = "=0.13.4"
 # 0.8.6 is the security-patched release in the 0.8 line (advisory affects < 0.8.6);
 # stays on rand_core 0.6, so no collision with the pinned rand_core =0.6.4.
 rand = "=0.8.6"
+# Integration tests assert fail-closed teardown (fcntl/close) on raw fds.
+libc = "=0.2.168"
 
 [profile.release]
 # `unwind` (not `abort`) so the `catch_unwind` FFI shields in interceptor.rs are

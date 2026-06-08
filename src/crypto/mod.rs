@@ -27,7 +27,7 @@ use ml_dsa::{
 use once_cell::sync::Lazy;
 use std::fmt;
 use std::sync::{Arc, RwLock};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// X25519 public-key length, shared by all suites.
 pub const X25519_LEN: usize = 32;
@@ -81,6 +81,43 @@ impl SessionKeys {
     pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.rx.open(ciphertext)
     }
+
+    /// Export TLS-1.3 AES-256-GCM traffic material for the kernel-TLS bridge.
+    ///
+    /// This is the *only* way raw key bytes leave `SessionKeys`, and it exists
+    /// solely so the v2 daemon can hand the keys to the kernel via
+    /// `setsockopt(SOL_TLS, ...)`. Each direction's 32-byte AEAD key is the one
+    /// already derived for that direction; the 4-byte salt + 8-byte IV (the
+    /// 96-bit implicit nonce) are HKDF-expanded from that key, so both peers
+    /// derive identical material for the matching direction (initiator TX ==
+    /// responder RX). The returned secrets zeroize on drop.
+    pub fn export_ktls(&self) -> KtlsTrafficKeys {
+        KtlsTrafficKeys {
+            tx: self.tx.ktls_secret(),
+            rx: self.rx.ktls_secret(),
+        }
+    }
+}
+
+/// TLS-1.3 AES-256-GCM traffic material for one direction, for the kTLS bridge.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct KtlsTrafficSecret {
+    pub key: [u8; 32],
+    pub salt: [u8; 4],
+    pub iv: [u8; 8],
+}
+
+impl fmt::Debug for KtlsTrafficSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KtlsTrafficSecret").finish_non_exhaustive()
+    }
+}
+
+/// Both directions exported from an established session.
+#[derive(Clone, Debug)]
+pub struct KtlsTrafficKeys {
+    pub tx: KtlsTrafficSecret,
+    pub rx: KtlsTrafficSecret,
 }
 
 /// Retained initiator handshake state. Consumed by `finish`.
