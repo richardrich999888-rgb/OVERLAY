@@ -8,6 +8,7 @@
 //! Runtime cipher agility (suite selection, negotiation, transcript binding)
 //! lives in `crypto::{mod, generic, nist768, nist1024}`.
 
+pub mod benchmarks;
 pub mod crypto;
 pub mod fd_state;
 pub mod interceptor;

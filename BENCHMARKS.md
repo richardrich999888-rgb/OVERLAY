@@ -10,21 +10,26 @@ data plane, the Mission-Adaptive state machine), the row is marked
 - Host: containerized sandbox, `nproc` = 4 cores, x86-64.
 - Network: loopback (`127.0.0.1`) via a userspace recording relay (no NIC, no
   `tc`/netem — those need Docker/CAP_NET_RAW, see `tests/netimpair_test.py`).
-- Build: `rustc 1.94.1`, `--release` (`opt-level = 3`, `panic = "abort"`).
+- Build: `rustc 1.94.1`, `--release` (`opt-level = 3`, `panic = "unwind"`).
 - Caveat: a dedicated bare-metal server (e.g. 3.3 GHz, AVX2) would be faster than
   this shared 4-core sandbox, but not by the multiples needed to flip the MISS
   rows below (handshake latency is ~3x over target; size is ~6.5x over).
 
 ## Scorecard
 
+Reproduce the crypto rows with `cargo bench` (harness in `benches/demo_benchmarks.rs`),
+the end-to-end rows with `python3 tests/characterize.py`, and the stability row
+with `cargo test crash_isolation`.
+
 | Category | Target | Measured | Verdict |
 |---|---|---|---|
-| Control-plane handshake latency | P99 ≤ 1.5 ms | **P99 4.2–4.7 ms** (in-proc, identity cached); 5.4–5.6 ms (rebuilt). End-to-end median 3.7 ms, p95 5.2–5.4 ms | ❌ **MISS ~3x** |
-| Handshake wire size | ≤ 2 KB | **13.06 KB** (NIST-768), **13.93 KB** (NIST-1024) | ❌ **MISS ~6.5x** |
-| Data-plane throughput | ≥ 95% line-rate | **12.8–15.5%** of loopback (v1 userspace) | ❌ MISS (v2 path not wired) |
+| Control-plane handshake latency (in-band) | P99 ≤ 1.5 ms | **P50 ~2.0 ms, P99 ~4.4 ms** (in-proc, post identity-cache). End-to-end median **2.3 ms** (was 3.7 ms before the cache fix) | ❌ **MISS ~3x** — bounded by ML-DSA |
+| …same handshake, ML-KEM-only projection | P99 ≤ 1.5 ms | **P50 0.33 ms, P99 0.38 ms** (768) — *unauthenticated* | ✅ **PASS** (shows the path to target = out-of-band auth) |
+| Handshake wire size (in-band) | ≤ 2 KB | **13.06 KB** (768), **13.93 KB** (1024); ML-KEM-only projection **2.3 KB** (768) | ❌ **MISS** (even KEM-only is 2.3 KB) |
+| Data-plane throughput | ≥ 95% line-rate | **12.8–15.5%** of loopback (v1 userspace); AEAD ceiling 546 MB/s (not the bottleneck) | ❌ MISS (v2 kTLS path not wired) |
 | eBPF hook invocation | ≤ 45 ns | eBPF program is a non-loading scaffold | ⬜ **NOT IMPLEMENTED** |
-| Kinetic switchover | ≤ 100 µs | state machine not in code | ⬜ **NOT IMPLEMENTED** |
-| Host process crash rate | 0.00% | `catch_unwind` is **inert under `panic = "abort"`** (release): panic → SIGABRT | ⚠️ **NOT MET in release artifact** |
+| Availability switchover | ≤ 100 µs | **encrypted** degraded fallback (no plaintext): control-plane decision+derive mean **47 µs**, max **164 µs**. eBPF kernel switch not implemented | 🔶 **Partial** (control-plane only) |
+| Host process crash rate | 0.00% | release now `panic = "unwind"` + poison-recovery; fault-injection test proves panic → **EIO + host upright** | ✅ **MET** (was SIGABRT under `panic="abort"`) |
 
 ## Detail and reproduction
 
@@ -43,13 +48,18 @@ NistStandard1024 [identity rebuilt] mean=3.217  p50=3.073  p90=4.148  p99=5.416 
 - The cost is **not** ML-KEM (KEM enc/dec is sub-ms). It is the **two ML-DSA-65
   signatures + two verifications per handshake** plus Ed25519. Lattice signatures,
   not KEM, dominate.
-- `[identity rebuilt]` vs `[identity cached]` quantifies a real fix:
-  `resolve_identity()` currently rebuilds Ed25519/ML-DSA keys on every handshake.
-  Caching saves ~1 ms of mean — worth doing, but does not reach 1.5 ms.
+- `[identity rebuilt]` vs `[identity cached]` quantified a real fix that is **now
+  applied**: `resolve_identity()` no longer rebuilds Ed25519/ML-DSA keys per
+  handshake — the constructed `IdentityMaterial` is cached behind an `Arc`. This
+  cut end-to-end median from **3.7 ms → 2.3 ms (−38%)** and raised setup rate
+  ~+48%. It still does not reach 1.5 ms; ML-DSA sign/verify dominates.
+- The `[2]` ML-KEM-only projection (P99 **0.38 ms**) shows the residual is the
+  signature, not the KEM: out-of-band identity auth is the only way to ≤1.5 ms.
 
-Reproduce: `cargo test --release --lib crypto::bench::bench_handshake_latency -- --nocapture --test-threads=1`
+Reproduce: `cargo bench` (section [1] in-band, [2] ML-KEM-only projection)
 
-End-to-end (TCP + apps, `tests/characterize.py`): median 3.70–3.75 ms, p95 5.17–5.40 ms.
+End-to-end (TCP + apps, `tests/characterize.py`): post-cache median **2.22–2.39 ms**,
+p95 **3.79–3.89 ms** (was median 3.70–3.75 ms, p95 5.17–5.40 ms before the fix).
 
 ### 2. Handshake size — `13 KB` vs 2 KB target → MISS
 
@@ -74,7 +84,7 @@ before any KEM bytes. Reaching ≤2 KB would require dropping in-band PQ signatu
 ct+pk ≈ 3.1 KB still exceeds 2 KB. **The 2 KB target is incompatible with the
 current PQ-mutual-auth design and should be re-baselined to ~13–14 KB.**
 
-Reproduce: `cargo test --release --lib crypto::bench::bench_handshake_size -- --nocapture --test-threads=1`
+Reproduce: `cargo bench` (section [3])
 
 ### 3. Data-plane throughput — `12.8–15.5%` vs ≥95% target → MISS (v1)
 
@@ -88,8 +98,7 @@ The ≥95% target therefore **cannot be evaluated until the v2 kTLS data plane i
 wired to the handshake** (the kTLS install primitive now exists and is tested in
 `tests/ktls_roundtrip.rs`, but the PQC→kTLS secret bridge does not).
 
-Reproduce: `cargo test --release --lib crypto::bench::bench_aead_throughput -- --nocapture --test-threads=1`
-and `python3 tests/characterize.py`.
+Reproduce: `cargo bench` (section [4]) and `python3 tests/characterize.py`.
 
 ### 4 & 5. eBPF hook latency / Kinetic switchover — NOT IMPLEMENTED
 
@@ -99,35 +108,50 @@ Garrison/Kinetic state machine do not exist in any ref. These targets cannot be
 measured until the components are built, and should not appear as achieved values
 in any dossier.
 
-### 6. Host crash rate — `catch_unwind` inert under release `panic = "abort"`
+### 6. Host crash rate — FIXED (was inert under `panic = "abort"`)
 
-The release profile sets `panic = "abort"` (correct: unwinding across the C FFI
-boundary is UB). But under `panic = "abort"`, `catch_unwind` does **not** catch —
-a panic calls `abort()` immediately. Demonstrated directly:
+Originally the release profile used `panic = "abort"`, under which `catch_unwind`
+cannot catch — a panic calls `abort()` immediately. Demonstrated directly:
 
 ```
 # rustc -C panic=unwind : catch_unwind CAUGHT -> process survives (exit 0)
 # rustc -C panic=abort  : process Aborted (SIGABRT, exit 134)
 ```
 
-So the `ffi_guard_*` shields in `src/interceptor.rs` protect debug/test builds but
-**are inert in the shipped `.so`**. Compounding this, hot paths use
-`REGISTRY.lock().unwrap()`, which aborts on mutex poisoning. To honestly claim
-0.00% host-crash either:
+Fix (committed): the release profile is now `panic = "unwind"`, so the
+`ffi_guard_*` shields are load-bearing; registry-lock poisoning is recovered
+(`into_inner`) and per-fd poisoning fails just that connection closed with EIO.
+A fault-injection test proves it:
 
-1. Keep `panic = "abort"` and **prove panic-freedom** on the interposed path
-   (remove `.unwrap()`/poison-abort, audit every reachable panic), or
-2. Switch the cdylib to `panic = "unwind"` with an FFI catch shim so the guards
-   are load-bearing, then add a fault-injection test asserting the host survives.
+```
+cargo test crash_isolation
+  ffi_guard_converts_panic_to_eio_without_crashing ... ok   # panic -> -1/EIO, host upright
+  registry_lock_recovers_from_poison ... ok
+  poisoned_fd_state_is_fail_closed_detectable ... ok
+```
 
-Until one of those lands, the 0.00% target is **not met by the release artifact**.
+### 7. Availability under daemon outage — encrypted fallback, never plaintext
+
+The "Kinetic" plaintext bypass was **not** built. Instead `select_posture()`
+returns `FullPqc` / `EncryptedFallback` / `FailClosed` — there is no `Plaintext`
+variant, so cleartext egress is unrepresentable. When the control plane is down
+and a PSK is configured, `derive_fallback_session()` gives a quantum-safe
+AES-256-GCM channel (no forward secrecy; documented tradeoff). Measured
+control-plane decision+derive latency: mean ~47 µs, max ~164 µs
+(`tests/defense_scenario_tests.rs`). This is a control-plane number, **not** the
+eBPF kernel switchover (that data plane is still unimplemented).
 
 ## What an evaluator should take away
 
 - The **correctness/security** posture is strong and tested (fail-closed, fork
-  safety, egress blocking, mutual PQ auth).
-- The **performance/size targets** as written are not met today: handshake latency
-  ~3x over, handshake size ~6.5x over, throughput a v2 dependency.
-- Two targets describe **unbuilt v2 components**; one (0.00% crash) is **undermined
-  by a build setting**. These are fixable or re-baselineable — but must not be
-  reported as achieved before they are.
+  safety, egress blocking, mutual PQ auth, host-crash isolation, no-plaintext
+  fallback).
+- **Latency** improved ~38% via identity caching (e2e median 3.7 → 2.3 ms) but
+  in-band still misses 1.5 ms by ~3x; the **ML-KEM-only projection meets it
+  (P99 0.38 ms)**, so the target is reachable only by moving identity auth
+  out-of-band.
+- **Size** misses ~6.5x in-band and ~1.15x even KEM-only (2.3 KB); the 2 KB
+  target needs re-baselining.
+- **Throughput** ≥95% and the **eBPF hook ≤45 ns** remain v2 dependencies (kTLS
+  install primitive exists and is tested; eBPF data plane and PQC→kTLS bridge do
+  not). These must not be reported as achieved before they are built.

@@ -11,6 +11,10 @@ name = "syntriass_overlay"
 crate-type = ["cdylib", "rlib"]
 # cdylib: the LD_PRELOAD .so.  rlib: lets `cargo test` link crypto.rs unit tests.
 
+[[bench]]
+name = "demo_benchmarks"
+harness = false
+
 [dependencies]
 # Raw FFI: dlsym/RTLD_NEXT, errno, fcntl, the real send/recv/connect. No SHA, no crypto here.
 libc = "=0.2.168"
