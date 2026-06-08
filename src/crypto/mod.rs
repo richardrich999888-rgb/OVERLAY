@@ -471,6 +471,28 @@ pub fn pqc_control_available() -> bool {
     }
 }
 
+/// Derive the Ed25519 + ML-DSA-65 public keys from local signing seeds.
+///
+/// The same derivation the `syntriass-identity` helper performs, exposed so a
+/// daemon (or test) can compute the peer public keys it must trust without
+/// re-implementing the key expansion.
+pub fn derive_identity_public_keys(
+    ed25519_seed: &[u8; ED25519_SEED_LEN],
+    mldsa65_seed: &[u8; MLDSA65_SEED_LEN],
+) -> Result<([u8; ED25519_PUBLIC_LEN], Vec<u8>), CryptoError> {
+    let ed_pub = Ed25519SigningKey::from_bytes(ed25519_seed)
+        .verifying_key()
+        .to_bytes();
+    let ml_seed =
+        ml_dsa::Seed::try_from(&mldsa65_seed[..]).map_err(|_| CryptoError::BadIdentityConfig)?;
+    let ml_pub = MlDsaSigningKey::<MlDsa65>::from_seed(&ml_seed)
+        .verifying_key()
+        .encode()
+        .as_slice()
+        .to_vec();
+    Ok((ed_pub, ml_pub))
+}
+
 fn read_identity_config_from_sources() -> Result<CachedIdentityConfig, CryptoError> {
     let file = std::fs::read_to_string("/etc/syntriass/identity.toml").ok();
     let own_ed_seed = read_identity_hex::<ED25519_SEED_LEN>(

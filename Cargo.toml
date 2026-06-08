@@ -53,6 +53,8 @@ prometheus = "=0.13.4"
 rand = "=0.8.6"
 # Integration tests assert fail-closed teardown (fcntl/close) on raw fds.
 libc = "=0.2.168"
+# Over-socket handshake tests drive a loopback pair with two async tasks.
+tokio = { version = "=1.43.0", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 
 [profile.release]
 # `unwind` (not `abort`) so the `catch_unwind` FFI shields in interceptor.rs are

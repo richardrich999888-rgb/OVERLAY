@@ -37,10 +37,11 @@ use serde::Serialize;
 use std::env;
 use std::os::unix::io::RawFd;
 use syntriass_overlay::kernel_native::{
-    self, KernelSockEvent, KernelUpcall, DEFAULT_UPCALL_SOCKET,
+    self, configured_suite, KernelSockEvent, KernelUpcall, DEFAULT_UPCALL_SOCKET,
 };
+use syntriass_overlay::over_socket::{establish_and_bridge, HandshakeRole};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 
 #[derive(Debug, Serialize)]
 struct UpcallResponse {
@@ -79,8 +80,51 @@ fn process_event_record(record: &[u8], fd: Option<RawFd>) -> UpcallResponse {
     }
 }
 
+/// Run the real over-socket hybrid handshake on a paused connection, then hand
+/// the live socket to kernel TLS. In a live v2 deployment the eBPF layer supplies
+/// the connection (the paused target socket); here the daemon's listener mode
+/// accepts it directly and plays the responder role.
+async fn serve_over_socket(stream: TcpStream, role: HandshakeRole) {
+    let suite = match configured_suite() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("syntriass daemon: no policy suite: {e}");
+            return;
+        }
+    };
+    let identity = match syntriass_overlay::crypto::resolve_identity() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("syntriass daemon: no identity: {e:?} (fail closed)");
+            return;
+        }
+    };
+    match establish_and_bridge(stream, &identity, suite, role).await {
+        Ok(()) => eprintln!("syntriass daemon: over-socket handshake -> kTLS installed"),
+        Err(e) => eprintln!("syntriass daemon: over-socket session failed closed: {e}"),
+    }
+}
+
+/// Over-socket responder mode: accept connections and establish kTLS on each.
+async fn run_over_socket_server(
+    addr: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind(addr).await?;
+    eprintln!("syntriass daemon over-socket responder listening on {addr}");
+    loop {
+        let (stream, _) = listener.accept().await?;
+        tokio::spawn(serve_over_socket(stream, HandshakeRole::Responder));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Over-socket responder mode drives the real PQC exchange across the live
+    // connection socket; the default mode consumes kernel upcalls.
+    if let Ok(addr) = env::var("SYNTRIASS_OVERSOCKET_LISTEN") {
+        return run_over_socket_server(&addr).await;
+    }
+
     let socket_path =
         env::var("SYNTRIASS_UPCALL_SOCKET").unwrap_or_else(|_| DEFAULT_UPCALL_SOCKET.to_string());
     let _ = std::fs::remove_file(&socket_path);
