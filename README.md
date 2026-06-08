@@ -26,6 +26,37 @@ Syntriass is intended for deployments where both peers are controlled, identity
 material can be provisioned out of band, and the operator wants a strict
 fail-closed runtime layer rather than a permissive best-effort shim.
 
+## Unique Selling Proposition
+
+Syntriass Overlay's USP is that it gives defence teams a fail-closed,
+post-quantum-ready transport protection layer for legacy TCP applications
+without requiring application rewrites.
+
+Most legacy-protection approaches force a tradeoff: either modify the
+application, place trust in an external network appliance, or accept partial
+coverage where some file-descriptor operations can still leak plaintext.
+Syntriass takes a different position: it runs inside the protected process,
+interposes the libc socket surface the application already uses, authenticates
+both peers with classical and post-quantum identity signatures, and blocks
+unsupported stream-socket egress paths instead of falling back to plaintext.
+
+The differentiator is not just encryption. The differentiator is **runtime
+enforcement**:
+
+- No source-code changes for the protected legacy application.
+- Hybrid classical plus post-quantum key exchange.
+- Dual Ed25519 plus ML-DSA-65 peer authentication.
+- Process-pinned suite policy with no downgrade path.
+- Fail-closed behavior for tampering, unauthenticated peers, malformed frames,
+  policy mismatch, and unsupported egress syscalls.
+- Fork-after-connect nonce-reuse protection for inherited active descriptors.
+- Wire-level proof harnesses showing that captured traffic is nonempty and the
+  protected plaintext marker is absent.
+
+In one sentence: **Syntriass turns an unmodified legacy TCP process into an
+identity-bound, post-quantum-hybrid, fail-closed encrypted endpoint with tested
+protection against common runtime bypass paths.**
+
 ## Business Use Cases
 
 Syntriass Overlay is aimed at organizations that need to raise the security
