@@ -717,3 +717,117 @@ strict fail-closed posture over its covered Linux/glibc socket surface. It is
 suitable for controlled evaluation and pilot environments where operators can
 provision peer identity material and validate the runtime harness on the target
 platform before deployment.
+
+---
+
+## Visual and Structural Architecture Blueprints
+
+To support technical reviews by CISOs, cryptographic auditors, and regulatory
+panels, the following diagrams map the process-local containment strategy, the
+authenticated hybrid handshake, and the fail-closed boundary conditions enforced
+by Syntriass Overlay.
+
+### 1. In-Memory Process Interception and Runtime Encapsulation
+
+Unlike a network-layer appliance that sits outside the host process, Syntriass
+executes inside the target process's user-space address space. With
+`LD_PRELOAD`, the overlay positions its cryptographic state machine between the
+unmodified legacy application binary and the standard Linux/glibc I/O surface.
+
+```text
++---------------------------------------------------------------+
+| Unmodified legacy application process                         |
+|                                                               |
+|  +------------------------+                                   |
+|  | Application binary     |                                   |
+|  | send/read/write/recv   |                                   |
+|  +-----------+------------+                                   |
+|              |                                                |
+|              v                                                |
+|  +------------------------+                                   |
+|  | Syntriass overlay      |                                   |
+|  | - fd registry          |                                   |
+|  | - identity handshake   |                                   |
+|  | - frame reassembly     |                                   |
+|  | - AEAD seal/open       |                                   |
+|  | - fail-closed guards   |                                   |
+|  +-----------+------------+                                   |
+|              |                                                |
+|              v                                                |
+|  +------------------------+                                   |
+|  | Real glibc/libc calls  |                                   |
+|  +-----------+------------+                                   |
++--------------|------------------------------------------------+
+               v
+        Linux kernel and network interface
+```
+
+From the application's perspective, ordinary file-descriptor operations remain
+unchanged. The translation from application plaintext to authenticated encrypted
+Syntriass frames occurs before protected payload bytes reach the network path.
+
+### 2. Hybrid Post-Quantum Handshake Pipeline
+
+When a protected stream socket starts an outgoing connection, Syntriass prevents
+application plaintext from being emitted until the overlay handshake has
+completed. Handshake latency is environment-dependent and should be measured
+with `tests/characterize.py` on the target Linux/glibc platform.
+
+```text
+Legacy client app     Local overlay          Remote overlay       Legacy server app
+       |                    |                       |                    |
+       | connect()          |                       |                    |
+       |------------------->|                       |                    |
+       |                    | ClientHello           |                    |
+       |                    | X25519 + ML-KEM       |                    |
+       |                    | Ed25519 + ML-DSA-65   |                    |
+       |                    |---------------------->|                    |
+       |                    |                       | validate identity  |
+       |                    |                       |------------------->|
+       |                    | ServerHello           |                    |
+       |                    | encapsulated secret   |                    |
+       |                    | Ed25519 + ML-DSA-65   |                    |
+       |                    |<----------------------|                    |
+       | connection ready   |                       |                    |
+       |<-------------------|                       |                    |
+       |                    | derive c2s/s2c keys   |                    |
+       |                    | with HKDF-SHA256      |                    |
+```
+
+Symmetric data channels are established only after both endpoints validate the
+peer's classical Ed25519 and post-quantum ML-DSA-65 identity signatures against
+pre-distributed public keys.
+
+### 3. Fail-Closed Containment Field
+
+The primary runtime invariant is simple: covered stream-socket traffic must pass
+through the cryptographic state machine, and unsupported or unsafe paths must
+not fall back to plaintext.
+
+```text
+                 Unmodified legacy application process
+                                      |
+               +----------------------+----------------------+
+               |                                             |
+               v                                             v
+ send/recv/read/write/readv/writev/sendmsg/recvmsg      sendto/sendmmsg/sendfile/splice
+               |                                             |
+               v                                             v
+      fd registry and PID guard                         interceptor hook
+               |                                             |
+       +-------+------------------+                          |
+       |                          |                          |
+       v                          v                          v
+ owner PID matches        owner PID mismatch          tracked stream socket
+       |                          |                          |
+       v                          v                          v
+ active session           fail-closed state            fail-closed error
+ seal/open data           scrub inherited keys         errno = EOPNOTSUPP
+ monotonic counter        errno = EPIPE                zero plaintext egress
+ emit overlay frame       zero data record
+```
+
+By trapping alternative high-performance I/O paths such as `sendfile64` and
+`splice`, and by binding active descriptor state to the owning process ID,
+Syntriass forces operational anomalies, fork duplication, and structural bypass
+attempts into explicit errors rather than silent security downgrades.
