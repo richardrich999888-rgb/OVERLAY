@@ -49,5 +49,10 @@ prometheus = "=0.13.4"
 rand = "=0.8.6"
 
 [profile.release]
-panic = "abort"   # A panic across the FFI boundary is UB; abort instead.
+# `unwind` (not `abort`) so the `catch_unwind` FFI shields in interceptor.rs are
+# load-bearing: a panic on the interposed path is caught at the boundary and
+# returned as EIO instead of SIGABRT-ing the host process. Safe because EVERY
+# `#[no_mangle] extern "C"` export is wrapped in `ffi_guard_*`, so a panic never
+# actually unwinds across the C boundary (which would be UB / would abort).
+panic = "unwind"
 opt-level = 3

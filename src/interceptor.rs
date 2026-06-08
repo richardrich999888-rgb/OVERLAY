@@ -14,8 +14,9 @@ use crate::fd_state::{
 use libc::c_uint;
 use libc::{c_int, c_void, iovec, msghdr, size_t, ssize_t};
 use once_cell::sync::{Lazy, OnceCell};
+use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::{cmp, ptr, slice};
 use zeroize::Zeroize;
 
@@ -374,14 +375,25 @@ fn drive_handshake(st: &mut FdState) {
 /// the registry guard. The returned `Arc` outlives the global lock; the caller
 /// takes the per-fd lock only after this function has returned, so no registry
 /// guard is ever alive at the point of a per-fd `.lock()`.
+/// Lock the global registry, recovering from poisoning instead of panicking.
+/// If a previous thread panicked while holding this lock (now caught by an FFI
+/// shield), the map itself is structurally intact, so taking the inner guard
+/// keeps every *other* connection working rather than wedging the whole overlay.
+fn lock_registry() -> MutexGuard<'static, HashMap<i32, Arc<Mutex<FdState>>>> {
+    match REGISTRY.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn lookup(fd: c_int) -> Option<Arc<Mutex<FdState>>> {
-    let reg = REGISTRY.lock().unwrap();
+    let reg = lock_registry();
     reg.get(&fd).cloned()
 }
 
 unsafe fn ensure_tracked(fd: c_int) -> bool {
     {
-        let reg = REGISTRY.lock().unwrap();
+        let reg = lock_registry();
         if reg.contains_key(&fd) {
             return true;
         }
@@ -390,7 +402,7 @@ unsafe fn ensure_tracked(fd: c_int) -> bool {
         return false;
     }
     let suite = failed_policy_suite();
-    let mut reg = REGISTRY.lock().unwrap();
+    let mut reg = lock_registry();
     reg.entry(fd).or_insert_with(|| {
         Arc::new(Mutex::new(match policy() {
             Ok(suite) => FdState::responder(suite),
@@ -418,7 +430,7 @@ unsafe fn install_initiator_state(fd: c_int) {
         }
         _ => FdState::failed(suite_for_failure),
     };
-    let mut reg = REGISTRY.lock().unwrap();
+    let mut reg = lock_registry();
     reg.insert(fd, Arc::new(Mutex::new(state)));
 }
 
@@ -503,10 +515,18 @@ unsafe fn overlay_send(fd: c_int, plaintext: &[u8], flags: c_int) -> ssize_t {
     // Per-fd lock taken exactly once here; the global registry lock is already
     // released (dropped inside `lookup`). All blocking I/O below runs under this
     // single guard and never re-locks this mutex on this thread.
-    // Sharp edge: std `Mutex` is non-reentrant and `.unwrap()` aborts on poison;
-    // with `panic = "abort"` a mid-I/O panic is fatal for this connection. Known,
-    // to revisit later -- error handling unchanged this round.
-    let mut st_guard = state.lock().unwrap();
+    // std `Mutex` is non-reentrant; we never re-lock it on this thread. On
+    // poisoning (a panic caught by the FFI shield mid-I/O) we fail this one
+    // connection closed with EIO; with `panic = "unwind"` the host stays up.
+    let mut st_guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Per-fd state may be mid-mutation; fail this connection closed
+            // rather than act on possibly-inconsistent state. Host stays up.
+            set_errno(libc::EIO);
+            return -1;
+        }
+    };
     let st = &mut *st_guard;
     if inherited_after_fork(st) {
         set_errno(libc::EPIPE);
@@ -607,10 +627,18 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
     // Per-fd lock taken exactly once here; the global registry lock is already
     // released (dropped inside `lookup`). All blocking I/O below runs under this
     // single guard and never re-locks this mutex on this thread.
-    // Sharp edge: std `Mutex` is non-reentrant and `.unwrap()` aborts on poison;
-    // with `panic = "abort"` a mid-I/O panic is fatal for this connection. Known,
-    // to revisit later -- error handling unchanged this round.
-    let mut st_guard = state.lock().unwrap();
+    // std `Mutex` is non-reentrant; we never re-lock it on this thread. On
+    // poisoning (a panic caught by the FFI shield mid-I/O) we fail this one
+    // connection closed with EIO; with `panic = "unwind"` the host stays up.
+    let mut st_guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Per-fd state may be mid-mutation; fail this connection closed
+            // rather than act on possibly-inconsistent state. Host stays up.
+            set_errno(libc::EIO);
+            return -1;
+        }
+    };
     let st = &mut *st_guard;
     if inherited_after_fork(st) {
         set_errno(libc::EPIPE);
@@ -1176,7 +1204,7 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         // no use-after-free. We do not hold the per-fd lock here, so `close` cannot
         // block behind a thread parked in a blocking read.
         let removed = {
-            let mut reg = REGISTRY.lock().unwrap();
+            let mut reg = lock_registry();
             reg.remove(&fd)
         };
         drop(removed);
