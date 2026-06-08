@@ -21,6 +21,11 @@ jobs:
   build-and-validate:
     name: Build and validate (Linux/glibc)
     runs-on: ubuntu-24.04
+    # Container `run:` steps default to `sh` (dash), which lacks `set -o pipefail`.
+    # Force bash so the pipefail-using steps below behave as written.
+    defaults:
+      run:
+        shell: bash
     container:
       image: rust:1-bookworm
 
