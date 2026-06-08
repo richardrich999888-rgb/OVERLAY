@@ -25,7 +25,9 @@ use ml_kem::{KemCore, MlKem1024, MlKem768};
 use rand_core::OsRng;
 use x25519_dalek::{EphemeralSecret, PublicKey as XPublicKey};
 
-use syntriass_overlay::crypto::{CipherSuite, IdentityMaterial, ED25519_SEED_LEN, MLDSA65_SEED_LEN};
+use syntriass_overlay::crypto::{
+    CipherSuite, IdentityMaterial, ED25519_SEED_LEN, MLDSA65_SEED_LEN,
+};
 
 const FAST_ITERS: usize = 5000; // X25519, Ed25519, AES-GCM
 const SLOW_ITERS: usize = 1000; // ML-KEM, ML-DSA, composite handshake
@@ -70,8 +72,12 @@ fn identities() -> (IdentityMaterial, IdentityMaterial) {
     let server_ed = [0x33u8; ED25519_SEED_LEN];
     let server_ml = [0x44u8; MLDSA65_SEED_LEN];
 
-    let c_ed_pub = EdSigningKey::from_bytes(&client_ed).verifying_key().to_bytes();
-    let s_ed_pub = EdSigningKey::from_bytes(&server_ed).verifying_key().to_bytes();
+    let c_ed_pub = EdSigningKey::from_bytes(&client_ed)
+        .verifying_key()
+        .to_bytes();
+    let s_ed_pub = EdSigningKey::from_bytes(&server_ed)
+        .verifying_key()
+        .to_bytes();
     let c_ml_seed = MlDsaSeed::try_from(&client_ml[..]).unwrap();
     let s_ml_seed = MlDsaSeed::try_from(&server_ml[..]).unwrap();
     let c_ml_pub = MlDsaSigningKey::<MlDsa65>::from_seed(&c_ml_seed)
@@ -212,9 +218,13 @@ fn main() {
     .as_slice()
     .to_vec();
     let id_load = bench(SLOW_ITERS, || {
-        let m =
-            IdentityMaterial::from_bytes(load_ed_seed, load_ml_seed, peer_ed_pub, peer_ml_pub.clone())
-                .unwrap();
+        let m = IdentityMaterial::from_bytes(
+            load_ed_seed,
+            load_ml_seed,
+            peer_ed_pub,
+            peer_ml_pub.clone(),
+        )
+        .unwrap();
         black_box(m);
     });
     let one_load_median = id_load.median;
@@ -266,7 +276,10 @@ fn main() {
     );
     row("X25519 keygen", FAST_ITERS, &x_keygen);
     row("X25519 keygen+DH", FAST_ITERS, &x_keygen_dh);
-    println!("{:<26} {:>8} {:>12.4} {:>12} {:>12}", "X25519 DH (derived)", FAST_ITERS, x_dh_median, "-", "-");
+    println!(
+        "{:<26} {:>8} {:>12.4} {:>12} {:>12}",
+        "X25519 DH (derived)", FAST_ITERS, x_dh_median, "-", "-"
+    );
     row("ML-KEM-768 keygen", SLOW_ITERS, &mlkem768_keygen);
     row("ML-KEM-768 encaps", SLOW_ITERS, &mlkem768_encaps);
     row("ML-KEM-768 decaps", SLOW_ITERS, &mlkem768_decaps);
