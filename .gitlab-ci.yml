@@ -1,0 +1,96 @@
+stages:
+  - lint
+  - build
+  - integration_test
+  - package
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+  SYNTRIASS_SO: "target/release/libsyntriass_overlay.so"
+
+default:
+  image: rust:1.85-slim-bookworm
+  before_script:
+    - apt-get update -yq
+    - apt-get install -yq python3 build-essential binutils >/dev/null
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .cargo/
+    - target/
+
+lint:core:
+  stage: lint
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --check
+    - cargo clippy --all-targets --locked -- -D warnings
+
+build:release:
+  stage: build
+  script:
+    - cargo build --release --locked
+    - test -f "$SYNTRIASS_SO"
+    - |
+      for sym in connect send recv read write readv writev sendmsg recvmsg sendto sendmmsg sendfile sendfile64 splice; do
+        if nm -D "$SYNTRIASS_SO" | grep -Eq " [TW] ${sym}$"; then
+          echo "symbol verified: ${sym}"
+        else
+          echo "missing exported interposition symbol: ${sym}" >&2
+          exit 1
+        fi
+      done
+    - mkdir -p dist
+    - cp "$SYNTRIASS_SO" dist/libsyntriass_overlay.so
+    - strip --strip-unneeded dist/libsyntriass_overlay.so
+    - sha256sum dist/libsyntriass_overlay.so > dist/SHA256SUMS
+  artifacts:
+    name: "syntriass-core-$CI_COMMIT_SHA"
+    paths:
+      - dist/libsyntriass_overlay.so
+      - dist/SHA256SUMS
+    expire_in: 1 week
+
+test:integration:
+  stage: integration_test
+  needs:
+    - job: build:release
+      artifacts: true
+  script:
+    - cargo test --release --locked
+    - python3 tests/verify_wire.py
+    - SYNTRIASS_SUITE=0x02 python3 tests/verify_wire.py
+    - python3 tests/failclosed_test.py
+    - python3 tests/concurrency_test.py
+    - python3 tests/fork_test.py
+    - python3 tests/egress_test.py
+    - python3 tests/characterize.py
+
+package:debian:
+  stage: package
+  needs:
+    - job: build:release
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  before_script:
+    - apt-get update -yq
+    - apt-get install -yq ruby ruby-dev rubygems build-essential >/dev/null
+    - gem install --no-document fpm
+  script:
+    - mkdir -p build_root/usr/lib/syntriass
+    - cp dist/libsyntriass_overlay.so build_root/usr/lib/syntriass/
+    - |
+      fpm -s dir -t deb \
+        -n syntriass-overlay \
+        -v "${CI_COMMIT_TAG#v}" \
+        --architecture amd64 \
+        --description "Post-quantum-hybrid runtime interposition shared object" \
+        -C build_root .
+  artifacts:
+    name: "syntriass-debian-package-$CI_COMMIT_TAG"
+    paths:
+      - "*.deb"

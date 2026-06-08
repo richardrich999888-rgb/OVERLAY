@@ -1,0 +1,143 @@
+name: Syntriass Overlay Production Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUST_TOOLCHAIN: "1.85.1"
+  SYNTRIASS_SO: target/release/libsyntriass_overlay.so
+
+jobs:
+  build-and-verify:
+    name: Build and validate runtime defenses
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Linux verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 build-essential binutils
+
+      - name: Enforce formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Compile release shared object
+        run: cargo build --release --locked
+
+      - name: Audit exported interposition symbols
+        run: |
+          set -euo pipefail
+          test -f "$SYNTRIASS_SO"
+          for sym in connect send recv read write readv writev sendmsg recvmsg sendto sendmmsg sendfile sendfile64 splice; do
+            if nm -D "$SYNTRIASS_SO" | grep -Eq " [TW] ${sym}$"; then
+              echo "symbol verified: ${sym}"
+            else
+              echo "missing exported interposition symbol: ${sym}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Run release unit tests
+        run: cargo test --release --locked
+
+      - name: Run containerized Linux/glibc interception test matrix
+        run: |
+          set -euo pipefail
+          docker run --rm -t -v "$PWD":/w -w /w rust:1.85-slim-bookworm bash -lc '
+            set -euo pipefail
+            apt-get update -yq
+            apt-get install -yq python3 build-essential binutils >/dev/null
+            cargo test --release --locked
+            python3 tests/verify_wire.py
+            SYNTRIASS_SUITE=0x02 python3 tests/verify_wire.py
+            python3 tests/failclosed_test.py
+            python3 tests/concurrency_test.py
+            python3 tests/fork_test.py
+            python3 tests/egress_test.py
+            python3 tests/characterize.py
+          '
+
+      - name: Strip production artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "$SYNTRIASS_SO" dist/libsyntriass_overlay.so
+          strip --strip-unneeded dist/libsyntriass_overlay.so
+          nm -D dist/libsyntriass_overlay.so | grep -Eq " [TW] connect$"
+          sha256sum dist/libsyntriass_overlay.so > dist/SHA256SUMS
+
+      - name: Archive production shared object
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsyntriass-overlay-linux-glibc
+          path: |
+            dist/libsyntriass_overlay.so
+            dist/SHA256SUMS
+          retention-days: 7
+
+  package-distribution:
+    name: Package enterprise distribution image
+    needs: build-and-verify
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download verified shared object
+        uses: actions/download-artifact@v4
+        with:
+          name: libsyntriass-overlay-linux-glibc
+          path: dist
+
+      - name: Create minimal artifact image Dockerfile
+        run: |
+          cat > dist/Dockerfile <<'EOF'
+          FROM scratch
+          COPY libsyntriass_overlay.so /usr/lib/syntriass/libsyntriass_overlay.so
+          LABEL org.opencontainers.image.title="Syntriass Overlay"
+          LABEL org.opencontainers.image.description="Post-quantum-hybrid runtime interposition shared object"
+          EOF
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build enterprise deployment image
+        uses: docker/build-push-action@v6
+        with:
+          context: dist
+          file: dist/Dockerfile
+          tags: syntriass/overlay-shield:${{ github.ref_name }}
+          push: false
