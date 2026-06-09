@@ -87,6 +87,24 @@ impl Direction {
         Ok(ct)
     }
 
+    /// Export TLS-1.3 AES-256-GCM material for kTLS: the AEAD key, plus a
+    /// 4-byte salt and 8-byte IV HKDF-expanded from that key (deterministic, so
+    /// both peers derive identical material for the matching direction).
+    pub(crate) fn ktls_secret(&self) -> super::KtlsTrafficSecret {
+        let mut okm = [0u8; 12];
+        Hkdf::<Sha256>::new(None, &self.key[..])
+            .expand(b"syntriass-overlay ktls salt+iv v1", &mut okm)
+            .expect("12 bytes is within HKDF output bounds");
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&self.key[..]);
+        let mut salt = [0u8; 4];
+        let mut iv = [0u8; 8];
+        salt.copy_from_slice(&okm[0..4]);
+        iv.copy_from_slice(&okm[4..12]);
+        okm.zeroize();
+        super::KtlsTrafficSecret { key, salt, iv }
+    }
+
     pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if self.counter == u64::MAX {
             return Err(CryptoError::NonceExhausted);
@@ -136,6 +154,33 @@ fn derive(
     c2s.zeroize();
     s2c.zeroize();
     Ok(keys)
+}
+
+/// Quantum-safe *degraded* fallback key schedule.
+///
+/// Derives an AES-256-GCM session purely from a pre-shared key plus a fresh
+/// client/server nonce pair — no asymmetric crypto at all. This is the
+/// confidentiality-preserving alternative to a plaintext bypass: when the full
+/// PQC control plane is unavailable, peers that share a PSK can still talk
+/// *encrypted* (AES-256 ⇒ 128-bit post-quantum security via Grover), and the PSK
+/// itself authenticates (an attacker without it derives a different key and AEAD
+/// open fails). The tradeoff vs. the full handshake is **no forward secrecy**
+/// (PSK reuse); that is the documented price of availability under jamming, and
+/// it never sends cleartext.
+pub(crate) fn derive_fallback(
+    psk: &[u8],
+    client_nonce: &[u8],
+    server_nonce: &[u8],
+    is_initiator: bool,
+) -> Result<SessionKeys, CryptoError> {
+    let mut h = Sha256::new();
+    h.update(b"syntriass-overlay psk-fallback transcript v1");
+    h.update(client_nonce);
+    h.update(server_nonce);
+    let th: [u8; 32] = h.finalize().into();
+    // 0xFF is reserved: `CipherSuite::from_id(0xFF)` is `None`, so fallback keys
+    // can never collide with a real suite's key schedule (domain separation).
+    derive(psk, 0xFF, &th, is_initiator)
 }
 
 /// Retained initiator secrets for a generic suite. Boxed behind `InitiatorState`.

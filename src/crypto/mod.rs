@@ -11,6 +11,7 @@
 //!   * `nist768`  - X25519 + ML-KEM-768  (suite id 0x01).
 //!   * `nist1024` - X25519 + ML-KEM-1024 (suite id 0x02).
 
+pub mod fallback;
 mod generic;
 pub mod nist1024;
 pub mod nist768;
@@ -26,8 +27,8 @@ use ml_dsa::{
 };
 use once_cell::sync::Lazy;
 use std::fmt;
-use std::sync::RwLock;
-use zeroize::Zeroize;
+use std::sync::{Arc, RwLock};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// X25519 public-key length, shared by all suites.
 pub const X25519_LEN: usize = 32;
@@ -40,6 +41,10 @@ pub const ED25519_SIGNATURE_LEN: usize = SIGNATURE_LENGTH;
 pub const ED25519_SEED_LEN: usize = SECRET_KEY_LENGTH;
 pub const IDENTITY_PUBLIC_LEN: usize = ED25519_PUBLIC_LEN + MLDSA65_PUBLIC_LEN;
 pub const IDENTITY_SIGNATURE_LEN: usize = ED25519_SIGNATURE_LEN + MLDSA65_SIGNATURE_LEN;
+
+/// Degraded-fallback pre-shared key + nonce sizes (quantum-safe symmetric path).
+pub const FALLBACK_PSK_LEN: usize = 32;
+pub const FALLBACK_NONCE_LEN: usize = 16;
 
 /// Errors that never panic the host process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +82,43 @@ impl SessionKeys {
     pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.rx.open(ciphertext)
     }
+
+    /// Export TLS-1.3 AES-256-GCM traffic material for the kernel-TLS bridge.
+    ///
+    /// This is the *only* way raw key bytes leave `SessionKeys`, and it exists
+    /// solely so the v2 daemon can hand the keys to the kernel via
+    /// `setsockopt(SOL_TLS, ...)`. Each direction's 32-byte AEAD key is the one
+    /// already derived for that direction; the 4-byte salt + 8-byte IV (the
+    /// 96-bit implicit nonce) are HKDF-expanded from that key, so both peers
+    /// derive identical material for the matching direction (initiator TX ==
+    /// responder RX). The returned secrets zeroize on drop.
+    pub fn export_ktls(&self) -> KtlsTrafficKeys {
+        KtlsTrafficKeys {
+            tx: self.tx.ktls_secret(),
+            rx: self.rx.ktls_secret(),
+        }
+    }
+}
+
+/// TLS-1.3 AES-256-GCM traffic material for one direction, for the kTLS bridge.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct KtlsTrafficSecret {
+    pub key: [u8; 32],
+    pub salt: [u8; 4],
+    pub iv: [u8; 8],
+}
+
+impl fmt::Debug for KtlsTrafficSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KtlsTrafficSecret").finish_non_exhaustive()
+    }
+}
+
+/// Both directions exported from an established session.
+#[derive(Clone, Debug)]
+pub struct KtlsTrafficKeys {
+    pub tx: KtlsTrafficSecret,
+    pub rx: KtlsTrafficSecret,
 }
 
 /// Retained initiator handshake state. Consumed by `finish`.
@@ -139,8 +181,15 @@ impl CipherSuite {
 }
 
 /// Long-term local identity plus the exact peer identity this process trusts.
-/// Secret signing keys are intentionally not cached process-wide by the
-/// interceptor; each handshake loads them and drops them after use.
+///
+/// The constructed material (with expanded Ed25519/ML-DSA-65 signing keys) is
+/// built once and cached process-wide behind an `Arc` in `RUNTIME_CONFIG`;
+/// handshakes clone the `Arc` instead of re-expanding the keys, which is the
+/// dominant per-handshake cost. The root seeds are *not* retained after
+/// construction (they are zeroized when the transient `CachedIdentityConfig`
+/// drops), so caching the derived keys does not widen secret residency beyond
+/// what holding the seeds already implied. All key material zeroizes on drop,
+/// and the cache is rebuilt on config hot-reload.
 pub struct IdentityMaterial {
     own_ed25519: Ed25519SigningKey,
     own_mldsa65: MlDsaSigningKey<MlDsa65>,
@@ -200,7 +249,10 @@ impl Drop for CachedIdentityConfig {
 
 struct RuntimeConfig {
     policy: Result<CipherSuite, &'static str>,
-    identity: Result<CachedIdentityConfig, CryptoError>,
+    /// Fully-constructed identity, shared by reference across handshakes so the
+    /// Ed25519/ML-DSA key expansion happens once per config epoch, not per
+    /// handshake.
+    identity: Result<Arc<IdentityMaterial>, CryptoError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,9 +371,15 @@ impl Drop for IdentityMaterial {
 // ----------------------- Late-binding policy resolution -----------------------
 
 fn load_runtime_config() -> RuntimeConfig {
+    // Build the identity (expand signing keys) once here; the transient
+    // `CachedIdentityConfig` carrying the raw seeds is dropped (and zeroized)
+    // as soon as the material is constructed.
+    let identity = read_identity_config_from_sources()
+        .and_then(|cfg| cfg.to_material())
+        .map(Arc::new);
     RuntimeConfig {
         policy: read_policy_from_sources(),
-        identity: read_identity_config_from_sources(),
+        identity,
     }
 }
 
@@ -361,14 +419,78 @@ fn read_policy_from_sources() -> Result<CipherSuite, &'static str> {
     Ok(CipherSuite::NistStandard768)
 }
 
-pub fn resolve_identity() -> Result<IdentityMaterial, CryptoError> {
+/// Return the process-wide identity, cloning the cached `Arc` (cheap) rather
+/// than re-expanding the signing keys (expensive). The cache is refreshed by
+/// `reload_runtime_config` on config hot-reload.
+pub fn resolve_identity() -> Result<Arc<IdentityMaterial>, CryptoError> {
     let guard = RUNTIME_CONFIG
         .read()
         .map_err(|_| CryptoError::BadIdentityConfig)?;
     match &guard.identity {
-        Ok(identity) => identity.to_material(),
+        Ok(identity) => Ok(Arc::clone(identity)),
         Err(e) => Err(*e),
     }
+}
+
+/// Derive a quantum-safe degraded-fallback session from a pre-shared key and a
+/// fresh nonce pair. Used only when the full PQC path is unavailable; it keeps
+/// traffic **encrypted** (never plaintext) at the cost of forward secrecy. Both
+/// peers must share the PSK and agree on the same nonces (initiator/responder
+/// roles mirror the key directions, as in the PQC path).
+pub fn derive_fallback_session(
+    psk: &[u8; FALLBACK_PSK_LEN],
+    client_nonce: &[u8; FALLBACK_NONCE_LEN],
+    server_nonce: &[u8; FALLBACK_NONCE_LEN],
+    is_initiator: bool,
+) -> Result<SessionKeys, CryptoError> {
+    generic::derive_fallback(psk, client_nonce, server_nonce, is_initiator)
+}
+
+/// Load the optional degraded-fallback PSK from `SYNTRIASS_FALLBACK_PSK_HEX`
+/// (64 hex chars = 32 bytes). Returns `None` when unset or malformed — the
+/// caller then has no fallback and must fail closed (never plaintext).
+pub fn resolve_fallback_psk() -> Option<[u8; FALLBACK_PSK_LEN]> {
+    let token = std::env::var("SYNTRIASS_FALLBACK_PSK_HEX").ok()?;
+    decode_hex_exact::<FALLBACK_PSK_LEN>(&token).ok()
+}
+
+/// Whether the asymmetric (PQC) control path is currently healthy.
+///
+/// This is a *local* signal — it is read from local configuration, never from
+/// the wire — which is what makes the fallback decision downgrade-resistant: an
+/// on-path attacker cannot flip it to force a healthy node into fallback. A v2
+/// deployment wires this to the daemon heartbeat; here it is driven by
+/// `SYNTRIASS_PQC_DEGRADED` (truthy => degraded) so the path is testable.
+pub fn pqc_control_available() -> bool {
+    match std::env::var("SYNTRIASS_PQC_DEGRADED") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "1" || v == "true" || v == "yes" || v == "on")
+        }
+        Err(_) => true,
+    }
+}
+
+/// Derive the Ed25519 + ML-DSA-65 public keys from local signing seeds.
+///
+/// The same derivation the `syntriass-identity` helper performs, exposed so a
+/// daemon (or test) can compute the peer public keys it must trust without
+/// re-implementing the key expansion.
+pub fn derive_identity_public_keys(
+    ed25519_seed: &[u8; ED25519_SEED_LEN],
+    mldsa65_seed: &[u8; MLDSA65_SEED_LEN],
+) -> Result<([u8; ED25519_PUBLIC_LEN], Vec<u8>), CryptoError> {
+    let ed_pub = Ed25519SigningKey::from_bytes(ed25519_seed)
+        .verifying_key()
+        .to_bytes();
+    let ml_seed =
+        ml_dsa::Seed::try_from(&mldsa65_seed[..]).map_err(|_| CryptoError::BadIdentityConfig)?;
+    let ml_pub = MlDsaSigningKey::<MlDsa65>::from_seed(&ml_seed)
+        .verifying_key()
+        .encode()
+        .as_slice()
+        .to_vec();
+    Ok((ed_pub, ml_pub))
 }
 
 fn read_identity_config_from_sources() -> Result<CachedIdentityConfig, CryptoError> {

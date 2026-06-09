@@ -17,6 +17,7 @@ const INIT_CONTAINER_NAME: &str = "syntriass-binary-copier";
 const APP_MOUNT_PATH: &str = "/usr/lib/syntriass";
 const INIT_MOUNT_PATH: &str = "/syntriass";
 const OVERLAY_LIBRARY_NAME: &str = "libsyntriass_overlay.so";
+const WEBHOOK_MODE_KERNEL_NATIVE: &str = "kernel-native";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,10 +186,57 @@ fn build_patch(pod: &Value) -> Result<Vec<JsonPatchOp>, &'static str> {
     }
 
     let mut patch = Vec::new();
-    push_volume_patch(pod, &mut patch);
-    push_init_container_patch(pod, &mut patch);
-    push_target_container_patch(pod, &mut patch, 0)?;
+    if env::var("SYNTRIASS_WEBHOOK_MODE")
+        .as_deref()
+        .is_ok_and(|mode| mode == WEBHOOK_MODE_KERNEL_NATIVE)
+    {
+        push_kernel_native_metadata_patch(pod, &mut patch);
+    } else {
+        push_volume_patch(pod, &mut patch);
+        push_init_container_patch(pod, &mut patch);
+        push_target_container_patch(pod, &mut patch, 0)?;
+    }
     Ok(patch)
+}
+
+fn push_kernel_native_metadata_patch(pod: &Value, patch: &mut Vec<JsonPatchOp>) {
+    push_metadata_field(
+        pod,
+        patch,
+        "/metadata/labels",
+        "syntriass.io/enforcement",
+        "kernel-native",
+    );
+    push_metadata_field(
+        pod,
+        patch,
+        "/metadata/annotations",
+        "syntriass.io/pqc-suite",
+        "policy",
+    );
+}
+
+fn push_metadata_field(
+    pod: &Value,
+    patch: &mut Vec<JsonPatchOp>,
+    object_path: &str,
+    key: &str,
+    value: &str,
+) {
+    let encoded_key = key.replace('/', "~1");
+    match pod.pointer(object_path).and_then(Value::as_object) {
+        Some(fields) if fields.get(key).and_then(Value::as_str) == Some(value) => {}
+        Some(fields) if fields.contains_key(key) => patch.push(replace(
+            &format!("{object_path}/{encoded_key}"),
+            json!(value),
+        )),
+        Some(_) => patch.push(add(&format!("{object_path}/{encoded_key}"), json!(value))),
+        None => {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(key.to_string(), json!(value));
+            patch.push(add(object_path, Value::Object(metadata)));
+        }
+    }
 }
 
 fn push_volume_patch(pod: &Value, patch: &mut Vec<JsonPatchOp>) {

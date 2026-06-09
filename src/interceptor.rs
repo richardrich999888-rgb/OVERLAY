@@ -6,16 +6,20 @@
 //! can move. If policy or identity material is missing, the fd is tracked as
 //! failed so later I/O returns an error instead of leaking plaintext.
 
+use crate::crypto::fallback::{self, FallbackInitiator};
 use crate::crypto::{self, CipherSuite};
 use crate::fd_state::{
-    current_pid, record_blocked_bypass_attempt, FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY,
+    current_pid, record_blocked_bypass_attempt, record_downgrade_attack,
+    record_fallback_activation, FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY,
 };
+use crate::kernel_native::{select_posture, AvailabilityPosture};
 #[cfg(target_os = "linux")]
 use libc::c_uint;
 use libc::{c_int, c_void, iovec, msghdr, size_t, ssize_t};
 use once_cell::sync::{Lazy, OnceCell};
+use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::{cmp, ptr, slice};
 use zeroize::Zeroize;
 
@@ -23,6 +27,10 @@ const HDR_LEN: usize = 4;
 const TYPE_CLIENT_HELLO: u8 = 1;
 const TYPE_SERVER_HELLO: u8 = 2;
 const TYPE_DATA: u8 = 3;
+const TYPE_FALLBACK_HELLO: u8 = 4;
+const TYPE_FALLBACK_FINISHED: u8 = 5;
+/// Wire suite-id marker carried by fallback frames (not a NIST suite).
+const FALLBACK_WIRE_ID: u8 = 0xFE;
 const MAX_FRAME_BODY: usize = MAX_WIRE_RX_BUFFER - HDR_LEN;
 const MAX_RECORD_PLAINTEXT: usize = 64 * 1024;
 const MAX_IOV_COPY: usize = 16 * 1024 * 1024;
@@ -311,6 +319,16 @@ fn queue_frame(st: &mut FdState, suite_id: u8, tag: u8, payload: &[u8]) -> Resul
     res
 }
 
+/// Local availability posture for this process. Computed from a *local*
+/// degradation signal and PSK configuration — never from the wire — so an MITM
+/// cannot push a healthy node into fallback.
+fn local_posture() -> AvailabilityPosture {
+    select_posture(
+        crypto::pqc_control_available(),
+        crypto::resolve_fallback_psk().is_some(),
+    )
+}
+
 fn drive_handshake(st: &mut FdState) {
     loop {
         let f = match try_pop_frame(&mut st.rx_wire) {
@@ -350,6 +368,43 @@ fn drive_handshake(st: &mut FdState) {
                     _ => st.fail_closed(),
                 }
             }
+            (FdPhase::ResponderAwaitingClientHello, TYPE_FALLBACK_HELLO) => {
+                // A peer is asking to use the PSK fallback. Accept ONLY if our own
+                // local posture is also degraded; a healthy FullPqc responder that
+                // is asked to fall back is witnessing a downgrade attempt.
+                match (local_posture(), crypto::resolve_fallback_psk()) {
+                    (AvailabilityPosture::EncryptedFallback, Some(psk)) => {
+                        match fallback::respond(&psk, &f.payload) {
+                            Ok((keys, finished)) => {
+                                if queue_frame(
+                                    st,
+                                    FALLBACK_WIRE_ID,
+                                    TYPE_FALLBACK_FINISHED,
+                                    &finished,
+                                )
+                                .is_ok()
+                                {
+                                    record_fallback_activation();
+                                    st.activate(keys);
+                                } else {
+                                    st.fail_closed();
+                                }
+                            }
+                            // Malformed/garbage fallback hello: treat as tamper.
+                            Err(_) => {
+                                record_downgrade_attack("malformed FallbackHello at responder");
+                                st.fail_closed();
+                            }
+                        }
+                    }
+                    _ => {
+                        record_downgrade_attack(
+                            "FallbackHello received by a non-degraded responder",
+                        );
+                        st.fail_closed();
+                    }
+                }
+            }
             (FdPhase::InitiatorAwaitingServerHello(state), TYPE_SERVER_HELLO) => {
                 match crypto::resolve_identity() {
                     Ok(identity) if f.suite_id == st.policy_suite.id() => {
@@ -360,6 +415,28 @@ fn drive_handshake(st: &mut FdState) {
                     }
                     _ => st.fail_closed(),
                 }
+            }
+            (FdPhase::InitiatorAwaitingFallbackFinished(state), TYPE_FALLBACK_FINISHED) => {
+                match state.finish(&f.payload) {
+                    Ok(keys) => {
+                        record_fallback_activation();
+                        st.activate(keys);
+                    }
+                    // A failed AEAD confirm means a wrong PSK or active tampering.
+                    Err(_) => {
+                        record_downgrade_attack("FallbackFinished failed PSK authentication");
+                        st.fail_closed();
+                    }
+                }
+            }
+            // A FullPqc node that receives a fallback frame mid-PQC, or any other
+            // unexpected (phase, type) pair, is a downgrade/tamper attempt.
+            (FdPhase::InitiatorAwaitingServerHello(_), TYPE_FALLBACK_HELLO)
+            | (FdPhase::InitiatorAwaitingServerHello(_), TYPE_FALLBACK_FINISHED)
+            | (FdPhase::InitiatorAwaitingFallbackFinished(_), TYPE_CLIENT_HELLO)
+            | (FdPhase::InitiatorAwaitingFallbackFinished(_), TYPE_SERVER_HELLO) => {
+                record_downgrade_attack("unexpected handshake frame type for current phase");
+                st.fail_closed();
             }
             _ => st.fail_closed(),
         }
@@ -374,14 +451,25 @@ fn drive_handshake(st: &mut FdState) {
 /// the registry guard. The returned `Arc` outlives the global lock; the caller
 /// takes the per-fd lock only after this function has returned, so no registry
 /// guard is ever alive at the point of a per-fd `.lock()`.
+/// Lock the global registry, recovering from poisoning instead of panicking.
+/// If a previous thread panicked while holding this lock (now caught by an FFI
+/// shield), the map itself is structurally intact, so taking the inner guard
+/// keeps every *other* connection working rather than wedging the whole overlay.
+fn lock_registry() -> MutexGuard<'static, HashMap<i32, Arc<Mutex<FdState>>>> {
+    match REGISTRY.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn lookup(fd: c_int) -> Option<Arc<Mutex<FdState>>> {
-    let reg = REGISTRY.lock().unwrap();
+    let reg = lock_registry();
     reg.get(&fd).cloned()
 }
 
 unsafe fn ensure_tracked(fd: c_int) -> bool {
     {
-        let reg = REGISTRY.lock().unwrap();
+        let reg = lock_registry();
         if reg.contains_key(&fd) {
             return true;
         }
@@ -390,7 +478,7 @@ unsafe fn ensure_tracked(fd: c_int) -> bool {
         return false;
     }
     let suite = failed_policy_suite();
-    let mut reg = REGISTRY.lock().unwrap();
+    let mut reg = lock_registry();
     reg.entry(fd).or_insert_with(|| {
         Arc::new(Mutex::new(match policy() {
             Ok(suite) => FdState::responder(suite),
@@ -402,24 +490,46 @@ unsafe fn ensure_tracked(fd: c_int) -> bool {
 
 unsafe fn install_initiator_state(fd: c_int) {
     let suite_for_failure = failed_policy_suite();
-    // All crypto runs before the global lock is taken; no I/O under the lock.
-    let state = match (policy(), crypto::resolve_identity()) {
-        (Ok(suite), Ok(identity)) => {
-            let engine = suite.engine();
-            match engine.begin_initiator(&identity) {
-                Ok((state, hello_body)) => {
-                    match frame(suite.id(), TYPE_CLIENT_HELLO, &hello_body) {
-                        Ok(f) => FdState::initiator(suite, state, f),
-                        Err(()) => FdState::failed(suite),
-                    }
-                }
-                Err(_) => FdState::failed(suite),
-            }
-        }
-        _ => FdState::failed(suite_for_failure),
+    // All crypto runs before the global lock is taken; no I/O under the lock. The
+    // posture is a LOCAL decision (degradation signal + PSK), never wire-driven.
+    let state = match policy() {
+        Ok(suite) => match local_posture() {
+            AvailabilityPosture::FullPqc => build_pqc_initiator(suite),
+            AvailabilityPosture::EncryptedFallback => build_fallback_initiator(suite),
+            AvailabilityPosture::FailClosed => FdState::failed(suite),
+        },
+        Err(()) => FdState::failed(suite_for_failure),
     };
-    let mut reg = REGISTRY.lock().unwrap();
+    let mut reg = lock_registry();
     reg.insert(fd, Arc::new(Mutex::new(state)));
+}
+
+/// Build a FullPqc initiator (the healthy path).
+fn build_pqc_initiator(suite: CipherSuite) -> FdState {
+    let Ok(identity) = crypto::resolve_identity() else {
+        return FdState::failed(suite);
+    };
+    let engine = suite.engine();
+    match engine.begin_initiator(&identity) {
+        Ok((state, hello_body)) => match frame(suite.id(), TYPE_CLIENT_HELLO, &hello_body) {
+            Ok(f) => FdState::initiator(suite, state, f),
+            Err(()) => FdState::failed(suite),
+        },
+        Err(_) => FdState::failed(suite),
+    }
+}
+
+/// Build a degraded-posture initiator that proposes the authenticated PSK
+/// fallback. Only reached when local posture is `EncryptedFallback` (PSK present).
+fn build_fallback_initiator(suite: CipherSuite) -> FdState {
+    let Some(psk) = crypto::resolve_fallback_psk() else {
+        return FdState::failed(suite);
+    };
+    let (state, hello) = FallbackInitiator::begin(psk);
+    match frame(FALLBACK_WIRE_ID, TYPE_FALLBACK_HELLO, &hello) {
+        Ok(f) => FdState::fallback_initiator(suite, state, f),
+        Err(()) => FdState::failed(suite),
+    }
 }
 
 unsafe fn drive_until_active_for_write(
@@ -503,10 +613,18 @@ unsafe fn overlay_send(fd: c_int, plaintext: &[u8], flags: c_int) -> ssize_t {
     // Per-fd lock taken exactly once here; the global registry lock is already
     // released (dropped inside `lookup`). All blocking I/O below runs under this
     // single guard and never re-locks this mutex on this thread.
-    // Sharp edge: std `Mutex` is non-reentrant and `.unwrap()` aborts on poison;
-    // with `panic = "abort"` a mid-I/O panic is fatal for this connection. Known,
-    // to revisit later -- error handling unchanged this round.
-    let mut st_guard = state.lock().unwrap();
+    // std `Mutex` is non-reentrant; we never re-lock it on this thread. On
+    // poisoning (a panic caught by the FFI shield mid-I/O) we fail this one
+    // connection closed with EIO; with `panic = "unwind"` the host stays up.
+    let mut st_guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Per-fd state may be mid-mutation; fail this connection closed
+            // rather than act on possibly-inconsistent state. Host stays up.
+            set_errno(libc::EIO);
+            return -1;
+        }
+    };
     let st = &mut *st_guard;
     if inherited_after_fork(st) {
         set_errno(libc::EPIPE);
@@ -607,10 +725,18 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
     // Per-fd lock taken exactly once here; the global registry lock is already
     // released (dropped inside `lookup`). All blocking I/O below runs under this
     // single guard and never re-locks this mutex on this thread.
-    // Sharp edge: std `Mutex` is non-reentrant and `.unwrap()` aborts on poison;
-    // with `panic = "abort"` a mid-I/O panic is fatal for this connection. Known,
-    // to revisit later -- error handling unchanged this round.
-    let mut st_guard = state.lock().unwrap();
+    // std `Mutex` is non-reentrant; we never re-lock it on this thread. On
+    // poisoning (a panic caught by the FFI shield mid-I/O) we fail this one
+    // connection closed with EIO; with `panic = "unwind"` the host stays up.
+    let mut st_guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Per-fd state may be mid-mutation; fail this connection closed
+            // rather than act on possibly-inconsistent state. Host stays up.
+            set_errno(libc::EIO);
+            return -1;
+        }
+    };
     let st = &mut *st_guard;
     if inherited_after_fork(st) {
         set_errno(libc::EPIPE);
@@ -1176,10 +1302,107 @@ pub unsafe extern "C" fn close(fd: c_int) -> c_int {
         // no use-after-free. We do not hold the per-fd lock here, so `close` cannot
         // block behind a thread parked in a blocking read.
         let removed = {
-            let mut reg = REGISTRY.lock().unwrap();
+            let mut reg = lock_registry();
             reg.remove(&fd)
         };
         drop(removed);
         (real().close)(fd)
     })
+}
+
+#[cfg(test)]
+mod crash_isolation_tests {
+    //! Fault-injection: prove an internal panic / lock-poison on the interposed
+    //! path is converted to a clean `-1`/`EIO` and the host process stays up,
+    //! instead of SIGABRT-ing it. Under `panic = "abort"` (the old release
+    //! profile) `catch_unwind` could not catch and the process aborted; the tests
+    //! run under the unwind profile that the cdylib now also uses.
+    use super::*;
+    use crate::crypto::CipherSuite;
+
+    fn silence_panics() {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
+
+    #[test]
+    fn ffi_guard_converts_panic_to_eio_without_crashing() {
+        silence_panics();
+        let rc = ffi_guard_ssize(|| panic!("simulated bug on interposed write path"));
+        assert_eq!(rc, -1, "guarded ssize panic must return -1");
+        unsafe { assert_eq!(errno(), libc::EIO, "errno must be EIO") };
+        let rc2 = ffi_guard_c_int(|| panic!("simulated bug on interposed connect path"));
+        assert_eq!(rc2, -1, "guarded c_int panic must return -1");
+        // Reaching this line at all proves the host (this process) survived.
+    }
+
+    #[test]
+    fn registry_lock_recovers_from_poison() {
+        // `lock_registry` works in the normal case...
+        {
+            let _g = lock_registry();
+        }
+        // ...and the recovery pattern it uses (`into_inner`) yields a usable
+        // guard even after poisoning. Demonstrated on a local mutex so we do not
+        // permanently poison the shared REGISTRY for sibling tests.
+        silence_panics();
+        let m = Mutex::new(0xABCDu32);
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _g = m.lock().unwrap();
+            panic!("poison");
+        }));
+        let g = match m.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        assert_eq!(*g, 0xABCD, "poison recovery must preserve the data");
+    }
+
+    #[test]
+    fn poisoned_fd_state_is_fail_closed_detectable() {
+        // A panic while holding a per-fd lock poisons it; the overlay_send/recv
+        // graceful path treats `state.lock()` == Err as fail-closed (returns EIO).
+        silence_panics();
+        let st = Arc::new(Mutex::new(FdState::failed(CipherSuite::NistStandard768)));
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _g = st.lock().unwrap();
+            panic!("poison per-fd state mid-mutation");
+        }));
+        assert!(
+            st.lock().is_err(),
+            "poisoned per-fd lock must be observable so I/O fails closed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    //! Downgrade resistance: a healthy `FullPqc` node must reject a fallback
+    //! frame on the wire (an MITM cannot push it into PSK mode). These tests rely
+    //! on the default (non-degraded) posture; no test sets `SYNTRIASS_PQC_DEGRADED`.
+    use super::*;
+    use crate::crypto::CipherSuite;
+
+    #[test]
+    fn fullpqc_responder_rejects_fallback_hello_as_downgrade() {
+        assert_eq!(local_posture(), AvailabilityPosture::FullPqc);
+        let mut st = FdState::responder(CipherSuite::NistStandard768);
+        let hello = vec![0u8; crate::crypto::FALLBACK_NONCE_LEN];
+        let f = frame(FALLBACK_WIRE_ID, TYPE_FALLBACK_HELLO, &hello).unwrap();
+        st.rx_wire.extend_from_slice(&f);
+        drive_handshake(&mut st);
+        assert!(
+            matches!(st.phase, FdPhase::Failed),
+            "a healthy FullPqc responder must fail closed on a FallbackHello"
+        );
+    }
+
+    #[test]
+    fn responder_rejects_fallback_finished_out_of_phase() {
+        // A responder should never receive a FallbackFinished first.
+        let mut st = FdState::responder(CipherSuite::NistStandard768);
+        let f = frame(FALLBACK_WIRE_ID, TYPE_FALLBACK_FINISHED, &[0u8; 64]).unwrap();
+        st.rx_wire.extend_from_slice(&f);
+        drive_handshake(&mut st);
+        assert!(matches!(st.phase, FdPhase::Failed));
+    }
 }
