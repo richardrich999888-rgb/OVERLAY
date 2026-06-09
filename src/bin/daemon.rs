@@ -35,7 +35,7 @@
 
 use serde::Serialize;
 use std::env;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use syntriass_overlay::kernel_native::{
     self, configured_suite, KernelSockEvent, KernelUpcall, DEFAULT_UPCALL_SOCKET,
 };
@@ -117,10 +117,64 @@ async fn run_over_socket_server(
     }
 }
 
+/// fd-passing mode: accept SCM_RIGHTS-injected sockets and protect each.
+///
+/// The injector (eBPF orchestration / a mock) connects to this UDS and passes the
+/// paused connection's fd as ancillary `SCM_RIGHTS` data. The daemon takes
+/// ownership, binds it into Tokio, and drives the over-socket responder handshake.
+async fn run_fd_passing_server(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
+    eprintln!("syntriass daemon fd-passing (SCM_RIGHTS) listening on {path}");
+    loop {
+        let (channel, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            if let Err(e) = handle_passed_fd(channel).await {
+                eprintln!("syntriass daemon: fd-passing channel error: {e}");
+            }
+        });
+    }
+}
+
+/// Receive one `SCM_RIGHTS` fd from `channel`, bind it into Tokio, and run the
+/// responder handshake. Any missing / invalid descriptor aborts the channel
+/// (fail closed) without ever touching application bytes.
+async fn handle_passed_fd(
+    channel: UnixStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // recvmsg is blocking; run it on a blocking thread with the UDS in blocking
+    // mode, and close the control channel as soon as the fd is consumed.
+    let std_channel = channel.into_std()?;
+    std_channel.set_nonblocking(false)?;
+    let uds_fd = std_channel.as_raw_fd();
+    let (_data, maybe_fd) = tokio::task::spawn_blocking(move || {
+        let result = syntriass_overlay::fd_passing::recv_fd(uds_fd);
+        drop(std_channel); // closes the control UDS
+        result
+    })
+    .await??;
+
+    let Some(fd) = maybe_fd else {
+        eprintln!("syntriass daemon: no SCM_RIGHTS fd in message -> abort (fail closed)");
+        return Ok(());
+    };
+
+    // Take ownership of the passed socket and feed it to the negotiation engine.
+    let std_tcp = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    std_tcp.set_nonblocking(true)?;
+    let stream = TcpStream::from_std(std_tcp)?;
+    serve_over_socket(stream, HandshakeRole::Responder).await;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Over-socket responder mode drives the real PQC exchange across the live
-    // connection socket; the default mode consumes kernel upcalls.
+    // fd-passing mode takes SCM_RIGHTS-injected sockets; over-socket mode drives
+    // the PQC exchange across a connection it accepts itself; the default mode
+    // consumes kernel upcalls.
+    if let Ok(path) = env::var("SYNTRIASS_FD_PASSING_UDS") {
+        return run_fd_passing_server(&path).await;
+    }
     if let Ok(addr) = env::var("SYNTRIASS_OVERSOCKET_LISTEN") {
         return run_over_socket_server(&addr).await;
     }

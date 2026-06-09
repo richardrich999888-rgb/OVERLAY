@@ -1,0 +1,39 @@
+# Out-of-tree eBPF data-plane crate for the Syntriass overlay.
+#
+# This crate is INTENTIONALLY a standalone workspace root (note the empty
+# `[workspace]` table below) so that `cargo` inside `ebpf/` does not try to join
+# the main `syntriass-overlay` package, and so the main workspace's
+# `cargo check`/`test`/`clippy` never attempt to build eBPF bytecode (which needs
+# a dedicated toolchain). See `xtask/README.md` for the build invocation.
+[package]
+name = "syntriass-ebpf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its own workspace root: do not walk up into the parent package.
+[workspace]
+
+[[bin]]
+name = "syntriass-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+# Kernel-space Aya runtime (the program imports `aya_ebpf`). The exact version
+# MUST match the `bpf-linker` / nightly toolchain installed on the build host;
+# it cannot be resolved or pinned-by-build in this sandbox. Adjust to the version
+# your `cargo install bpf-linker` expects.
+aya-ebpf = "0.1.1"
+
+[profile.dev]
+panic = "abort"
+
+# Verifier-friendly bytecode: abort (no unwinding in eBPF), whole-program LTO,
+# max optimization, single codegen unit for a compact, inlined object.
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
+codegen-units = 1
+debug = false
+overflow-checks = false

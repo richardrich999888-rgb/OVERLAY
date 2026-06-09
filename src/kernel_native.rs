@@ -66,6 +66,31 @@ pub struct KernelSockEvent {
     pub _pad: u16,
 }
 
+// Compile-time ABI guard. `KernelSockEvent` (user space) and `maps::SockEvent`
+// (kernel, in the out-of-tree ebpf crate) MUST be byte-identical. Any reorder,
+// resize, or alignment change here fails `cargo check` immediately instead of
+// becoming a silent kernel<->user wire mismatch. The kernel side carries the
+// mirror of these asserts in `ebpf/src/maps.rs`.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    assert!(
+        size_of::<KernelSockEvent>() == 56,
+        "KernelSockEvent must be 56 bytes"
+    );
+    assert!(
+        align_of::<KernelSockEvent>() == 8,
+        "KernelSockEvent must be 8-byte aligned"
+    );
+    assert!(offset_of!(KernelSockEvent, cookie) == 0);
+    assert!(offset_of!(KernelSockEvent, cgroup_id) == 8);
+    assert!(offset_of!(KernelSockEvent, src_addr) == 16);
+    assert!(offset_of!(KernelSockEvent, dst_addr) == 32);
+    assert!(offset_of!(KernelSockEvent, src_port) == 48);
+    assert!(offset_of!(KernelSockEvent, dst_port) == 50);
+    assert!(offset_of!(KernelSockEvent, family) == 52);
+    assert!(offset_of!(KernelSockEvent, _pad) == 54);
+};
+
 impl KernelSockEvent {
     pub const WIRE_LEN: usize = core::mem::size_of::<KernelSockEvent>();
 

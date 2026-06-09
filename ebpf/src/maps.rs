@@ -21,6 +21,22 @@ pub struct SockEvent {
     pub _pad: u16,
 }
 
+// Compile-time ABI guard mirroring `kernel_native::KernelSockEvent` in user
+// space. If the kernel struct drifts, the eBPF crate fails to compile.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<SockEvent>() == 56, "SockEvent must be 56 bytes");
+    assert!(align_of::<SockEvent>() == 8, "SockEvent must be 8-byte aligned");
+    assert!(offset_of!(SockEvent, cookie) == 0);
+    assert!(offset_of!(SockEvent, cgroup_id) == 8);
+    assert!(offset_of!(SockEvent, src_addr) == 16);
+    assert!(offset_of!(SockEvent, dst_addr) == 32);
+    assert!(offset_of!(SockEvent, src_port) == 48);
+    assert!(offset_of!(SockEvent, dst_port) == 50);
+    assert!(offset_of!(SockEvent, family) == 52);
+    assert!(offset_of!(SockEvent, _pad) == 54);
+};
+
 /// Retained per-socket enforcement metadata (kept in a SockHash/SockMap).
 #[repr(C)]
 #[derive(Clone, Copy)]
