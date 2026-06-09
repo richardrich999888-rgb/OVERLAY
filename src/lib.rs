@@ -8,6 +8,8 @@
 //! Runtime cipher agility (suite selection, negotiation, transcript binding)
 //! lives in `crypto::{mod, generic, nist768, nist1024}`.
 
+#[cfg(feature = "cdac-accel")]
+pub mod accelerator;
 pub mod benchmarks;
 pub mod crypto;
 pub mod fd_passing;

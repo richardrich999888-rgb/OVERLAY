@@ -56,6 +56,15 @@ libc = "=0.2.168"
 # Over-socket handshake tests drive a loopback pair with two async tasks.
 tokio = { version = "=1.43.0", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 
+[features]
+# Compile + link the C-DAC ParaS (SYCL 2020) offload bridge (host-fallback via
+# g++; real SYCL via `parascc`). Off by default so the baseline build is unchanged.
+cdac-accel = []
+
+[build-dependencies]
+# Compiles src/accelerator/cdac_sycl_bridge.cpp under the `cdac-accel` feature.
+cc = "1.2"
+
 [profile.release]
 # `unwind` (not `abort`) so the `catch_unwind` FFI shields in interceptor.rs are
 # load-bearing: a panic on the interposed path is caught at the boundary and
