@@ -9,6 +9,10 @@ Syntriass is designed for organizations that need crypto-agility now: the
 ability to introduce, test, and change cryptographic protection around existing
 systems without waiting for multi-year rewrite cycles.
 
+## Ownership
+
+Syntriass Overlay is owned and maintained by K. NAGA SRI GANESH.
+
 ## For RBI, Q-SAFE-Oriented Reviews, and Financial Regulators
 
 The RBI's Q-SAFE direction highlights the need for financial institutions to

@@ -3,6 +3,7 @@ name = "syntriass-overlay"
 version = "0.1.0"
 edition = "2021"
 description = "Linux LD_PRELOAD transparent hybrid (X25519 + ML-KEM-768) encryption tunnel for POSIX stream sockets. PoC."
+authors = ["K. NAGA SRI GANESH"]
 license = "MIT OR Apache-2.0"
 publish = false
 
