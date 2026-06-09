@@ -3,3 +3,7 @@ dist/
 files.zip
 files_unzipped/
 tests/__pycache__/
+
+# Mininet range runtime artifacts
+benchmarks/mininet_local_range/raw_logs.txt
+*.pcap
