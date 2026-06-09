@@ -39,7 +39,7 @@ ml-dsa = { version = "=0.1.1", features = ["getrandom", "zeroize"] }
 zeroize = { version = "=1.8.2", features = ["derive"] }
 # Admission webhook control plane binary.
 axum = "=0.7.9"
-tokio = { version = "=1.43.0", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio = { version = "=1.43.1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.132"
 base64 = "=0.22.1"
@@ -54,7 +54,7 @@ rand = "=0.8.6"
 # Integration tests assert fail-closed teardown (fcntl/close) on raw fds.
 libc = "=0.2.168"
 # Over-socket handshake tests drive a loopback pair with two async tasks.
-tokio = { version = "=1.43.0", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+tokio = { version = "=1.43.1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 
 [profile.release]
 # `unwind` (not `abort`) so the `catch_unwind` FFI shields in interceptor.rs are
