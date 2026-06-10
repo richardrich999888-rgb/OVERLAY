@@ -31,6 +31,9 @@ use super::{
 
 /// HKDF label prefix. The concrete suite id is appended for transcript binding.
 const HKDF_LABEL_PREFIX: &[u8] = b"syntriass-overlay v3 suite=";
+/// Domain-separation label for the forward-secret rekey ratchet (see
+/// [`Direction::ratchet`]). The epoch counter is appended for uniqueness.
+const REKEY_LABEL: &[u8] = b"syntriass-overlay rekey v1";
 const CLIENT_AUTH_LABEL: &[u8] = b"syntriass-overlay client identity v1";
 const SERVER_AUTH_LABEL: &[u8] = b"syntriass-overlay server identity v1";
 const KEY_TRANSCRIPT_LABEL: &[u8] = b"syntriass-overlay transcript hash v1";
@@ -46,6 +49,12 @@ fn nonce_from_counter(counter: u64) -> [u8; 12] {
 
 /// One AEAD direction with an owned, monotonic counter. Public methods only
 /// expose seal/open; the key and counter are private.
+///
+/// `Clone` exists solely so the hardened record layer (`crypto::session`) can
+/// retain the previous epoch's receive direction for one rekey step (in-flight
+/// records). The clone never crosses the crate boundary and both copies zeroize
+/// on drop.
+#[derive(Clone)]
 pub struct Direction {
     key: Zeroizing<[u8; 32]>,
     counter: u64,
@@ -123,6 +132,73 @@ impl Direction {
             .map_err(|_| CryptoError::Decrypt)?;
         self.counter += 1;
         Ok(pt)
+    }
+
+    /// Seal at an explicit sequence number, binding `aad` (the record header)
+    /// into the GCM tag. Unlike [`seal`](Self::seal) this does not touch the
+    /// internal counter: the hardened record layer owns sequencing. The 96-bit
+    /// nonce is derived from `seq`; because every rekey installs a fresh
+    /// [`ratchet`](Self::ratchet)ed key and `seq` is unique per epoch, no
+    /// `(key, nonce)` pair is ever reused.
+    pub(crate) fn seal_at(
+        &self,
+        seq: u64,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let n = nonce_from_counter(seq);
+        let cipher =
+            Aes256Gcm::new_from_slice(self.key.as_ref()).map_err(|_| CryptoError::Encrypt)?;
+        cipher
+            .encrypt(
+                Nonce::from_slice(&n),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .map_err(|_| CryptoError::Encrypt)
+    }
+
+    /// Open a record sealed with [`seal_at`](Self::seal_at). The caller is
+    /// responsible for anti-replay; this only authenticates `(seq, aad, ct)`.
+    pub(crate) fn open_at(
+        &self,
+        seq: u64,
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let n = nonce_from_counter(seq);
+        let cipher =
+            Aes256Gcm::new_from_slice(self.key.as_ref()).map_err(|_| CryptoError::Decrypt)?;
+        cipher
+            .decrypt(
+                Nonce::from_slice(&n),
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|_| CryptoError::Decrypt)
+    }
+
+    /// One-way symmetric ratchet for intra-session forward secrecy. The new key
+    /// is `HKDF-SHA256(old_key, "syntriass-overlay rekey v1" || epoch)`; the old
+    /// key bytes are overwritten in place (the buffer is `Zeroizing`). Because
+    /// HKDF is one-way, an adversary who compromises the post-ratchet key cannot
+    /// recover any earlier epoch's key (and therefore cannot decrypt earlier
+    /// traffic). The per-direction counter is reset for the new epoch.
+    pub(crate) fn ratchet(&mut self, epoch: u32) {
+        let mut info = Vec::with_capacity(REKEY_LABEL.len() + 4);
+        info.extend_from_slice(REKEY_LABEL);
+        info.extend_from_slice(&epoch.to_be_bytes());
+        let hk = Hkdf::<Sha256>::new(None, self.key.as_ref());
+        let mut next = [0u8; 32];
+        hk.expand(&info, &mut next)
+            .expect("32 bytes is within HKDF output bounds");
+        self.key[..].copy_from_slice(&next);
+        next.zeroize();
+        self.counter = 0;
     }
 }
 

@@ -15,6 +15,11 @@ pub mod fallback;
 mod generic;
 pub mod nist1024;
 pub mod nist768;
+pub mod session;
+
+pub use session::{
+    AntiReplayWindow, SecureSession, SessionError, SessionLimits, SessionState, RECORD_HEADER_LEN,
+};
 
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as Ed25519Signer, SigningKey as Ed25519SigningKey,
@@ -81,6 +86,21 @@ impl SessionKeys {
     /// Decrypt one inbound application record.
     pub fn open(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.rx.open(ciphertext)
+    }
+
+    /// Consume the keys into their two raw AEAD directions.
+    ///
+    /// This is how [`session::SecureSession`] takes ownership of the established
+    /// key material to build the hardened (sequenced, replay-protected,
+    /// rekeyable) record layer on top of the handshake. Crate-internal: the
+    /// directions still never expose their key bytes.
+    pub(crate) fn into_directions(self) -> (Direction, Direction) {
+        (self.tx, self.rx)
+    }
+
+    /// Wrap these keys in the hardened record layer ([`session::SecureSession`]).
+    pub fn into_secure_session(self, limits: SessionLimits) -> SecureSession {
+        SecureSession::new(self, limits)
     }
 
     /// Export TLS-1.3 AES-256-GCM traffic material for the kernel-TLS bridge.
