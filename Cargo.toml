@@ -31,6 +31,13 @@ aes-gcm = "=0.10.3"
 # Key schedule.
 hkdf = "=0.12.4"
 sha2 = "=0.10.8"
+# Stateless handshake-cookie MAC (HMAC-SHA256) for the anti-DoS admission gate.
+# Already in the lock as a transitive dep of hkdf; promoted to a direct dep here
+# (no new package enters the tree).
+hmac = "=0.12.1"
+# Constant-time cookie/tag comparison (timing-safe admission). Already in the
+# lock via the dalek stack; promoted to a direct dep (no tree expansion).
+subtle = "=2.6.1"
 # Classical identity signatures.
 ed25519-dalek = { version = "=2.2.0", features = ["rand_core", "zeroize"] }
 # Post-quantum identity signatures (FIPS 204 ML-DSA-65).

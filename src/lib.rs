@@ -14,6 +14,7 @@ pub mod benchmarks;
 pub mod crypto;
 pub mod fd_passing;
 pub mod fd_state;
+pub mod handshake_guard;
 pub mod interceptor;
 pub mod kernel_native;
 pub mod over_socket;
