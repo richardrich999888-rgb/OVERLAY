@@ -124,8 +124,11 @@ jobs:
           rustup toolchain install nightly --profile minimal
           rustup component add rust-src --toolchain nightly
           sudo apt-get update -yq
-          # build-essential: gcc + glibc static libs for the direct-syscall client.
-          sudo apt-get install -yq llvm tcpdump docker.io golang python3 build-essential
+          # NB: Docker is pre-installed on GitHub-hosted ubuntu-24.04 runners;
+          # installing docker.io conflicts with the runner's containerd.io. The
+          # container workload uses the pre-installed Docker. build-essential
+          # provides gcc + glibc static libs for the direct-syscall client.
+          sudo apt-get install -yq llvm tcpdump golang python3 build-essential
           cargo +nightly install bpf-linker --locked
           sudo modprobe tls || echo "tls module load skipped (may be built-in)"
 
