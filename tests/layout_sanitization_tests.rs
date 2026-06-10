@@ -12,7 +12,11 @@
 
 use std::mem::{align_of, offset_of, size_of};
 
-use syntriass_overlay::kernel_native::KernelSockEvent;
+use syntriass_overlay::{
+    audit::events::KernelFlowEvent,
+    kernel::maps::{PolicyKey, PolicyValue, SessionValue},
+    kernel_native::KernelSockEvent,
+};
 
 /// The canonical wire layout (field, offset). The kernel `SockEvent` must match
 /// this exactly; if you change one side, change the other or the build breaks.
@@ -63,4 +67,58 @@ fn no_padding_holes_in_the_event() {
     // verifier-checked layout).
     let summed = 8 + 8 + 16 + 16 + 2 + 2 + 2 + 2;
     assert_eq!(summed, size_of::<KernelSockEvent>());
+}
+
+#[test]
+fn kernel_flow_event_is_exactly_64_bytes() {
+    assert_eq!(
+        size_of::<KernelFlowEvent>(),
+        64,
+        "flow event ABI size drift"
+    );
+    assert_eq!(KernelFlowEvent::WIRE_LEN, 64);
+    assert_eq!(align_of::<KernelFlowEvent>(), 8);
+}
+
+#[test]
+fn kernel_flow_event_field_offsets_are_canonical() {
+    assert_eq!(offset_of!(KernelFlowEvent, event_type), 0);
+    assert_eq!(offset_of!(KernelFlowEvent, decision), 4);
+    assert_eq!(offset_of!(KernelFlowEvent, pid), 8);
+    assert_eq!(offset_of!(KernelFlowEvent, tgid), 12);
+    assert_eq!(offset_of!(KernelFlowEvent, cgroup_id), 16);
+    assert_eq!(offset_of!(KernelFlowEvent, socket_cookie), 24);
+    assert_eq!(offset_of!(KernelFlowEvent, family), 32);
+    assert_eq!(offset_of!(KernelFlowEvent, protocol), 36);
+    assert_eq!(offset_of!(KernelFlowEvent, dst_addr), 40);
+    assert_eq!(offset_of!(KernelFlowEvent, dst_port), 56);
+    assert_eq!(offset_of!(KernelFlowEvent, action), 58);
+    assert_eq!(offset_of!(KernelFlowEvent, reason), 59);
+}
+
+#[test]
+fn policy_key_and_value_layouts_are_canonical() {
+    assert_eq!(size_of::<PolicyKey>(), 32, "PolicyKey ABI size drift");
+    assert_eq!(align_of::<PolicyKey>(), 8, "PolicyKey ABI alignment drift");
+    assert_eq!(offset_of!(PolicyKey, cgroup_id), 0);
+    assert_eq!(offset_of!(PolicyKey, family), 8);
+    assert_eq!(offset_of!(PolicyKey, dst_ip), 12);
+    assert_eq!(offset_of!(PolicyKey, dst_port), 28);
+
+    assert_eq!(size_of::<PolicyValue>(), 1, "PolicyValue ABI size drift");
+    assert_eq!(align_of::<PolicyValue>(), 1);
+    assert_eq!(offset_of!(PolicyValue, action), 0);
+}
+
+#[test]
+fn session_value_layout_is_canonical() {
+    assert_eq!(size_of::<SessionValue>(), 48, "SessionValue ABI size drift");
+    assert_eq!(
+        align_of::<SessionValue>(),
+        8,
+        "SessionValue ABI alignment drift"
+    );
+    assert_eq!(offset_of!(SessionValue, session_id), 0);
+    assert_eq!(offset_of!(SessionValue, session_state), 32);
+    assert_eq!(offset_of!(SessionValue, expires_at), 40);
 }

@@ -47,6 +47,9 @@ base64 = "=0.22.1"
 # Metrics exposition for the webhook/admin sidecar surface.
 prometheus = "=0.13.4"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "=0.12.0", default-features = false }
+
 [dev-dependencies]
 # For deterministic unit tests we feed fixed seeds through a seedable RNG.
 # 0.8.6 is the security-patched release in the 0.8 line (advisory affects < 0.8.6);

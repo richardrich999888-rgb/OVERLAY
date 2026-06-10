@@ -8,13 +8,18 @@
 //! Runtime cipher agility (suite selection, negotiation, transcript binding)
 //! lives in `crypto::{mod, generic, nist768, nist1024}`.
 
+pub mod audit;
 pub mod benchmarks;
 pub mod crypto;
 pub mod fd_passing;
 pub mod fd_state;
 pub mod interceptor;
+pub mod kernel;
 pub mod kernel_native;
 pub mod over_socket;
+pub mod policy;
+pub mod proxy;
+pub mod session;
 pub mod telemetry;
 
 /// Starts the Linux configuration hot-reload worker.

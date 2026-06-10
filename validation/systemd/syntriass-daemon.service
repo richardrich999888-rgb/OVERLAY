@@ -1,0 +1,20 @@
+[Unit]
+Description=SYNTRIASS kernel validation daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/syntriass
+Environment=SYNTRIASS_EBPF_OBJECT=/opt/syntriass/ebpf/target/bpfel-unknown-none/release/syntriass-ebpf
+Environment=SYNTRIASS_CGROUP_PATH=/sys/fs/cgroup/syntriass-validation
+Environment=SYNTRIASS_MAP_PIN_PATH=/sys/fs/bpf/syntriass
+ExecStart=/opt/syntriass/target/release/daemon
+Restart=on-failure
+RestartSec=2
+CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
+AmbientCapabilities=CAP_BPF CAP_SYS_ADMIN CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

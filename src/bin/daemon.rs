@@ -136,6 +136,57 @@ async fn run_fd_passing_server(path: &str) -> Result<(), Box<dyn std::error::Err
     }
 }
 
+async fn run_kernel_visibility(
+    bpf_object: &str,
+    cgroup_path: &str,
+    map_pin_path: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config =
+        syntriass_overlay::kernel::loader::KernelVisibilityConfig::new(bpf_object, cgroup_path)
+            .with_map_pin_path(map_pin_path);
+    let mut runtime = syntriass_overlay::kernel::loader::KernelVisibilityRuntime::load(&config)?;
+    let mut sink = syntriass_overlay::audit::sink::JsonStdoutSink;
+    eprintln!(
+        "syntriass daemon kernel visibility attached: object={bpf_object} cgroup={cgroup_path} map_pin_path={map_pin_path}"
+    );
+    runtime.run(&mut sink).await
+}
+
+#[cfg(target_os = "linux")]
+fn run_session_establisher(
+    socket_cookie: u64,
+    ttl_secs: u64,
+    map_pin_path: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let suite = configured_suite()?;
+    let session_id =
+        syntriass_overlay::session::run_authenticated_pqc_session(socket_cookie, suite)
+            .map_err(|e| format!("PQC handshake failed: {e:?}"))?;
+    let store = syntriass_overlay::session::linux::BpfSessionStore::open_pinned(
+        &std::path::PathBuf::from(map_pin_path),
+    )?;
+    let mut manager = syntriass_overlay::session::SessionManager::new(store);
+    let entry = manager.insert_state(
+        socket_cookie,
+        session_id,
+        syntriass_overlay::session::SessionState::PqcEstablished,
+        syntriass_overlay::session::monotonic_expiry_after(std::time::Duration::from_secs(
+            ttl_secs,
+        )),
+    )?;
+    println!("{}", serde_json::to_string(&entry)?);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_session_establisher(
+    _socket_cookie: u64,
+    _ttl_secs: u64,
+    _map_pin_path: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Err("session establishment requires Linux and pinned SESSION_MAP".into())
+}
+
 /// Receive one `SCM_RIGHTS` fd from `channel`, bind it into Tokio, and run the
 /// responder handshake. Any missing / invalid descriptor aborts the channel
 /// (fail closed) without ever touching application bytes.
@@ -177,6 +228,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     if let Ok(addr) = env::var("SYNTRIASS_OVERSOCKET_LISTEN") {
         return run_over_socket_server(&addr).await;
+    }
+    // Transparent proxy mode: redirected application connections are accepted
+    // here, tunneled to the remote peer over a real PQC handshake, and kTLS-
+    // encrypted in-kernel. This is the data path that makes interception
+    // *encrypt* unmodified apps, not merely gate them.
+    if let Ok(addr) = env::var("SYNTRIASS_PROXY_LISTEN") {
+        let suite = configured_suite()?;
+        let identity = syntriass_overlay::crypto::resolve_identity()
+            .map_err(|e| format!("transparent proxy: no identity: {e:?} (fail closed)"))?;
+        return syntriass_overlay::proxy::run_proxy(&addr, identity, suite)
+            .await
+            .map_err(Into::into);
+    }
+    if let Ok(cookie) = env::var("SYNTRIASS_SESSION_COOKIE") {
+        let socket_cookie = cookie.parse::<u64>()?;
+        let ttl_secs = env::var("SYNTRIASS_SESSION_TTL_SECS")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse::<u64>()?;
+        let map_pin_path = env::var("SYNTRIASS_MAP_PIN_PATH")
+            .unwrap_or_else(|_| "/sys/fs/bpf/syntriass".to_string());
+        run_session_establisher(socket_cookie, ttl_secs, &map_pin_path)?;
+        return Ok(());
+    }
+    if let Ok(bpf_object) = env::var("SYNTRIASS_EBPF_OBJECT") {
+        let cgroup_path =
+            env::var("SYNTRIASS_CGROUP_PATH").unwrap_or_else(|_| "/sys/fs/cgroup".to_string());
+        let map_pin_path = env::var("SYNTRIASS_MAP_PIN_PATH")
+            .unwrap_or_else(|_| "/sys/fs/bpf/syntriass".to_string());
+        return run_kernel_visibility(&bpf_object, &cgroup_path, &map_pin_path).await;
     }
 
     let socket_path =

@@ -1,5 +1,3 @@
-#![no_std]
-
 //! Shared kernel/user-space map types for the Syntriass eBPF data plane.
 //!
 //! `SockEvent` MUST stay byte-for-byte identical to
@@ -40,6 +38,7 @@ const _: () = {
 /// Retained per-socket enforcement metadata (kept in a SockHash/SockMap).
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub struct SecureSocket {
     pub socket_id: u64,
     pub local_port: u16,
@@ -58,7 +57,9 @@ pub struct KernelCounters {
     pub failures: u64,
 }
 
+#[allow(dead_code)]
 pub const SOCKET_FLAG_PQC_REQUIRED: u32 = 1 << 0;
+#[allow(dead_code)]
 pub const SOCKET_FLAG_KTLS_READY: u32 = 1 << 1;
 
 /// Address families as the verifier sees them (mirror of libc).
