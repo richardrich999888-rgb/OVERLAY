@@ -1,0 +1,16 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash ca-certificates clang curl gcc git iproute2 iputils-ping jq \
+    libc6-dev libelf-dev llvm make pkg-config python3 python3-venv \
+    rustup tcpdump tshark wget xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /syntriass
+COPY . /syntriass
+
+RUN rustup default stable
+
+CMD ["/bin/bash"]

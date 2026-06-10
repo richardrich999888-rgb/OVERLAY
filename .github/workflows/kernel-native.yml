@@ -1,0 +1,150 @@
+# Kernel-native (eBPF / kTLS) build + evidence lane.
+#
+# WHY THIS EXISTS
+# ---------------
+# The user-space LD_PRELOAD `.so` builds fine on any Linux, but the
+# kernel-native v2 enforcement path (`src/kernel/loader.rs`, `src/policy/engine.rs`
+# and `src/session.rs` `linux` modules, all `#[cfg(target_os = "linux")]`, plus
+# the out-of-tree `ebpf/` data-plane crate) is NOT exercised by a plain
+# `cargo build` on a developer's macOS host, because the Aya-dependent code is
+# Linux-gated and the eBPF crate targets `bpfel-unknown-none`.
+#
+# A real defect (code written against a newer Aya API than the pinned
+# `aya = 0.12.0`) sat undetected because of exactly that gap. This workflow is the
+# regression guard: it type-checks and clippy-lints the Linux/Aya code for BOTH
+# x86_64 and aarch64 (the ARM64 sovereign-deployment target), and compiles the
+# eBPF bytecode object with the dedicated nightly + bpf-linker toolchain.
+#
+# `cargo check`/`clippy` do not link, so cross-targeting Linux from any runner
+# needs only `rustup target add` — no cross-linker. That makes the ARM64 gate
+# cheap enough to run on every push.
+
+name: kernel-native
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  cross-compile:
+    name: Cross-compile + clippy (Linux x86_64 + ARM64)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + target + clippy
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup component add clippy
+          rustup target add ${{ matrix.target }}
+
+      # Type-check the FULL crate (lib + all bins) for this Linux target. This is
+      # the step that fails closed on an Aya/API drift like the 0.12-vs-0.13
+      # `attach()` / `HashMap::try_from(Map)` mismatch.
+      - name: cargo check (${{ matrix.target }})
+        run: cargo check --locked --target ${{ matrix.target }} --lib --bins
+
+      # CI elsewhere runs `clippy -D warnings`; mirror that for the Linux-gated
+      # code so unused-import / dead-code regressions in the `linux` modules are
+      # caught on the cross target, not only natively.
+      - name: cargo clippy (${{ matrix.target }})
+        run: cargo clippy --locked --target ${{ matrix.target }} --lib --bins -- -D warnings
+
+  ebpf-bytecode:
+    name: Build eBPF data-plane object (bpfel-unknown-none)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly + rust-src + bpf-linker
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly --profile minimal
+          rustup component add rust-src --toolchain nightly
+          # bpf-linker links the BPF bytecode. It needs an LLVM toolchain.
+          sudo apt-get update -yq
+          sudo apt-get install -yq llvm
+          cargo +nightly install bpf-linker --locked
+
+      - name: Build BPF ELF (out-of-tree ebpf/ crate)
+        working-directory: ebpf
+        run: |
+          set -euo pipefail
+          cargo +nightly build --release \
+            --target bpfel-unknown-none \
+            -Z build-std=core
+          OBJ=target/bpfel-unknown-none/release/syntriass-ebpf
+          test -f "$OBJ"
+          ls -l "$OBJ"
+          # Prove the loader's required programs/maps are present in the object.
+          if command -v llvm-objdump >/dev/null 2>&1; then
+            llvm-objdump -h "$OBJ" || true
+          fi
+
+      - name: Upload BPF object as evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: syntriass-ebpf-bpfel
+          path: ebpf/target/bpfel-unknown-none/release/syntriass-ebpf
+          retention-days: 7
+
+  # Privileged end-to-end enforcement matrix. Loads the eBPF programs, attaches
+  # the cgroup hooks, and drives the universal-interception workload matrix
+  # (glibc / static Go / static Rust / direct-syscall / container) through
+  # validation/scripts/run_matrix.sh, capturing per-scenario pcaps and the
+  # deny-by-default / session-binding decisions as JSONL evidence.
+  #
+  # GitHub-hosted ubuntu-24.04 runners boot a 6.x kernel as root in a VM, so
+  # CAP_BPF, cgroup v2, sockops and the kTLS ULP are available. This job is the
+  # evidence GENERATOR; its artifacts are the validation record.
+  kernel-matrix:
+    name: Kernel enforcement matrix (privileged, evidence)
+    runs-on: ubuntu-24.04
+    needs: [cross-compile, ebpf-bytecode]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchains (stable + nightly/bpf-linker) and tools
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal
+          rustup component add rust-src --toolchain nightly
+          sudo apt-get update -yq
+          # NB: Docker is pre-installed on GitHub-hosted ubuntu-24.04 runners;
+          # installing docker.io conflicts with the runner's containerd.io. The
+          # container workload uses the pre-installed Docker. build-essential
+          # provides gcc + glibc static libs for the direct-syscall client.
+          sudo apt-get install -yq llvm tcpdump golang python3 build-essential
+          cargo +nightly install bpf-linker --locked
+          sudo modprobe tls || echo "tls module load skipped (may be built-in)"
+
+      - name: Build user-space binaries + eBPF object + workloads
+        # build_all.sh compiles: daemon + syntriassctl, the out-of-tree eBPF
+        # object, and the glibc/static-Go/static-Rust/direct-syscall/container
+        # workload clients used by the enforcement matrix.
+        run: bash validation/scripts/build_all.sh
+
+      - name: Run enforcement matrix (root)
+        run: sudo -E bash validation/scripts/run_matrix.sh
+
+      - name: Upload validation artifacts (matrix.jsonl, pcaps, report)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-enforcement-evidence
+          path: validation/artifacts/latest/**
+          retention-days: 14

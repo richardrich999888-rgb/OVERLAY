@@ -590,6 +590,24 @@ fn fail_closed_shutdown(fd: RawFd) {
     }
 }
 
+/// Install kTLS for an established session on a **borrowed** connected socket,
+/// WITHOUT taking ownership of the fd and WITHOUT closing it on failure.
+///
+/// This is the variant the transparent proxy (`crate::proxy`) needs: the proxy
+/// keeps the `TcpStream` alive to splice application bytes across it, so the fd
+/// must not be closed here. Fail-closed is still guaranteed because on `Err` the
+/// proxy drops both streams (closing them) before relaying any bytes — no
+/// plaintext can traverse a socket that never reached the kTLS state. The
+/// exported key material zeroizes when the local `KtlsDuplexKeys` drops.
+pub fn install_session_ktls(fd: RawFd, keys: &SessionKeys) -> Result<(), KernelNativeError> {
+    let traffic = keys.export_ktls();
+    let duplex = KtlsDuplexKeys {
+        tx: KtlsSecrets::from_traffic_secret(&traffic.tx),
+        rx: KtlsSecrets::from_traffic_secret(&traffic.rx),
+    };
+    install_ktls_keys(fd, &duplex)
+}
+
 /// The PQC -> kTLS bridge: export the established session's traffic keys, pack
 /// them into the kernel's `tls12_crypto_info_aes_gcm_256`, and install them on
 /// `fd` for both directions. The exported key material is zeroized as the

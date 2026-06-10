@@ -17,22 +17,65 @@
 use aya_ebpf::{
     bindings::{BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB, BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB},
     helpers::{bpf_get_current_cgroup_id, bpf_get_socket_cookie},
-    macros::{map, sock_ops},
-    maps::{Array, RingBuf},
-    programs::SockOpsContext,
+    macros::{cgroup_sock_addr, map, sock_ops},
+    maps::{Array, HashMap, RingBuf},
+    programs::{SockAddrContext, SockOpsContext},
 };
 
+mod audit;
+mod cgroup_connect;
 mod maps;
+mod types;
 use maps::{KernelCounters, SockEvent, AF_INET, AF_INET6};
+use types::{FlowKey, IdentityRecord, PendingFlow, PolicyKey, PolicyValue, SessionValue};
 
 /// 256 KiB lock-free ring buffer for connection upcalls.
 #[map(name = "EVENTS")]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+/// Phase 1 audit ring buffer for cgroup/connect visibility.
+#[map(name = "AUDIT_RINGBUF")]
+pub static AUDIT_RINGBUF: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+/// Phase 1 flow inventory keyed by cgroup/process/destination tuple.
+#[map(name = "FLOW_PENDING_MAP")]
+pub static FLOW_PENDING_MAP: HashMap<FlowKey, PendingFlow> = HashMap::with_max_entries(65_536, 0);
+
+/// Workload identity cache populated by user space in later phases. Present in
+/// Phase 1 so the ABI and pinning surface is stable before enforcement begins.
+#[map(name = "IDENTITY_MAP")]
+pub static IDENTITY_MAP: HashMap<u64, IdentityRecord> = HashMap::with_max_entries(16_384, 0);
+
+/// Phase 2 deny-by-default egress policy map. Pinned so `syntriassctl` can
+/// update it without reloading the eBPF programs.
+#[map(name = "POLICY_MAP")]
+pub static POLICY_MAP: HashMap<PolicyKey, PolicyValue> = HashMap::pinned(65_536, 0);
+
+/// Phase 3 transport-binding state. A policy allow is insufficient unless the
+/// socket cookie has an established, unexpired PQC session here.
+#[map(name = "SESSION_MAP")]
+pub static SESSION_MAP: HashMap<u64, SessionValue> = HashMap::pinned(65_536, 0);
+
 #[map(name = "KERNEL_COUNTERS")]
 static KERNEL_COUNTERS: Array<KernelCounters> = Array::with_max_entries(1, 0);
 
-#[sock_ops(name = "syntriass_sock_handler")]
+#[cgroup_sock_addr(connect4)]
+pub fn syntriass_connect4(ctx: SockAddrContext) -> i32 {
+    match cgroup_connect::handle_connect4(ctx) {
+        Ok(action) => action,
+        Err(_) => cgroup_connect::CGROUP_DENY,
+    }
+}
+
+#[cgroup_sock_addr(connect6)]
+pub fn syntriass_connect6(ctx: SockAddrContext) -> i32 {
+    match cgroup_connect::handle_connect6(ctx) {
+        Ok(action) => action,
+        Err(_) => cgroup_connect::CGROUP_DENY,
+    }
+}
+
+#[sock_ops]
 pub fn syntriass_sock_handler(ctx: SockOpsContext) -> u32 {
     match try_handle(&ctx) {
         Ok(action) => action,
