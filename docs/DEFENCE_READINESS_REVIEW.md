@@ -30,6 +30,7 @@ yet backed by committed evidence.
 | **FC-1** | Fail-closed assurance gap: no automated proof of no-cleartext / no-panic / concurrency safety; 85/86 `unsafe` blocks undocumented; a misaligned-reference UB in the config watcher | High → **Low** | **Mitigated + validated here: property + leakage + concurrency proof, panic-path & unsafe audit (1 UB bug fixed), and Miri + Loom + cargo-fuzz all run on a nightly toolchain** | `docs/FAIL_CLOSED_ASSURANCE.md`; `tests/fail_closed_properties.rs`, `tests/concurrency_stress.rs`, `tests/leakage_analysis.rs`, `tests/loom_model.rs`; `scripts/run_miri.sh`, `fuzz/`; `src/lib.rs` (`#![deny(unused_must_use)]`) |
 | **IL-1** | No identity lifecycle: peer keys statically pinned, never enrolled/rotated/revoked/expired | High → **Low** | **Mitigated: hybrid-PQC credential lifecycle — enrollment+PoP, issuance, scheduled & emergency rotation, renewal, CRL revocation with monotonic propagation, expiry, lost-key/compromised-node recovery, and offline/air-gap provisioning — 28 tests + benchmarks, shown driving the real handshake; TPM2/PKCS#11/HSM evaluated as design with infra plan** | `docs/IDENTITY_LIFECYCLE.md`, `docs/OFFLINE_PROVISIONING.md`; `src/identity.rs`; `tests/identity_lifecycle_tests.rs`; `benches/identity_benchmarks.rs` |
 | **C1** | LD_PRELOAD interception is incomplete (static/Go/musl/direct-syscall bypass it) | High → **Low** | **Replaced with a kernel `cgroup/connect4` eBPF data plane, built+loaded+attached+measured: 7/7 runtimes intercepted incl. the 4 LD_PRELOAD blind spots; fail-closed deny enforced (EPERM)** | `docs/UNIVERSAL_INTERCEPTION.md`; `ebpf/c/`, `ebpf/COVERAGE_REPORT.txt`; `scripts/ebpf_coverage_validate.sh` |
+| **KS-1** | File-based key storage: raw seeds on disk, no hardware protection | High → **Low–Medium** | **Backend-agnostic key-protection layer: software (AES-GCM) + TPM2 + PKCS#11/HSM. Software fully tested; TPM (swtpm) and PKCS#11 (SoftHSM2) backends validated end-to-end through the real Rust adapter against software substitutes — incl. sealed-to-hardware (a different TPM can't unseal). Physical-device acceptance = design** | `docs/KEY_STORAGE_ARCHITECTURE.md`, `docs/TPM_INTEGRATION.md`, `docs/HSM_INTEGRATION.md`; `src/keystore.rs`; `tests/keystore_external_tests.rs`; `scripts/keystore/` |
 | C2–C5, C7 | Resilience (`tc netem`), sovereign/ARM, et al. | — | **Open / tracked** | host-only / future increments (see §4) |
 
 > The original review's full C-series text was a chat-only artifact. Rather than
@@ -232,6 +233,14 @@ lane* to run Miri/Loom/fuzz per-PR (R2), not an unaddressed code weakness.
    rust-musl/direct-syscall/python (7/7, incl. the 4 cases LD_PRELOAD cannot see)
    and enforced a fail-closed `EPERM` deny. `docs/UNIVERSAL_INTERCEPTION.md`,
    `ebpf/COVERAGE_REPORT.txt`.
+6. **Sovereign key storage (KS-1).** A backend-agnostic key-protection layer
+   (`KeyProtector` trait + `SealedKeystore`): software (AES-256-GCM under a
+   passphrase KEK, 10 tests) plus TPM 2.0 and PKCS#11/HSM backends. The external
+   backends were validated **end-to-end through the real Rust adapter** against
+   `swtpm` and SoftHSM2 — sealing the hybrid identity seeds, transporting them,
+   and unsealing to reconstruct the signer; a different TPM cannot unseal
+   (sealed-to-hardware). Physical-device acceptance is `[design]`.
+   `docs/KEY_STORAGE_ARCHITECTURE.md`, `docs/TPM_INTEGRATION.md`, `docs/HSM_INTEGRATION.md`.
 
 The Rust crate is pure-Rust and adds no packages to the main dependency tree; the
 eBPF data plane is out-of-tree C+libbpf (built by clang, not part of `cargo build`).
@@ -252,9 +261,12 @@ not be read as validated:
 - **`tc netem` 10/20/30/45% loss** at the kernel qdisc level (the record-layer
   loss numbers above use an in-process model, clearly labelled as such).
 - **Sovereign ARM64** hardware validation.
-- **Hardware-backed identity keys** (TPM2/PKCS#11/HSM) — the lifecycle *software*
-  path is validated (IL-1); the hardware backends need `swtpm`/SoftHSM2 (CI) or a
-  real TPM/HSM and are design + plan only here (`docs/IDENTITY_LIFECYCLE.md §4`).
+- **Hardware-backed key storage on a PHYSICAL device** (a real TPM chip / FIPS
+  HSM). The TPM2 and PKCS#11 backends are **validated against software substitutes**
+  (`swtpm`, SoftHSM2) end-to-end through the real Rust adapter (KS-1); a physical-
+  device acceptance test is `[design]` (`docs/TPM_INTEGRATION.md §5`,
+  `docs/HSM_INTEGRATION.md §5`). The ML-DSA key stays software-resident until
+  PQC-capable HSMs ship.
 
 > Note: Miri / Loom / cargo-fuzz (FC-1) are **no longer** on this list — they were
 > run here on a nightly toolchain (see §2A and `docs/FAIL_CLOSED_ASSURANCE.md`).
@@ -274,7 +286,8 @@ cargo test --test handshake_dos_tests --test handshake_dos_integration \
            --test session_hardening_tests -- --nocapture
 cargo test --test fail_closed_properties --test concurrency_stress \
            --test leakage_analysis -- --nocapture
-cargo test --lib identity --test identity_lifecycle_tests -- --nocapture
+cargo test --lib identity --lib keystore --test identity_lifecycle_tests -- --nocapture
+sudo bash scripts/keystore/validate.sh        # TPM (swtpm) + PKCS#11 (SoftHSM2)
 cargo test --test chaos_orchestration     # spawns the real daemon binary
 # nightly (validated here): scripts/run_miri.sh ; cargo test --test loom_model --release ;
 #                           cargo +nightly fuzz run cookie_parse -- -max_total_time=60

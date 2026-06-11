@@ -30,6 +30,7 @@ pub mod identity;
 #[cfg(not(miri))]
 pub mod interceptor;
 pub mod kernel_native;
+pub mod keystore;
 pub mod over_socket;
 pub mod telemetry;
 
