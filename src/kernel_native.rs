@@ -412,6 +412,9 @@ mod sys {
 /// state error (e.g. `ENOTCONN`) — both of which mean "supported".
 #[cfg(target_os = "linux")]
 pub fn ktls_supported() -> bool {
+    // SAFETY: the probe creates its own throwaway socket; `setsockopt` only
+    // reads the 3-byte "tls" buffer; the fd is closed exactly once before
+    // returning on every path.
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
         if fd < 0 {
@@ -451,6 +454,8 @@ pub fn ktls_supported() -> bool {
 #[cfg(target_os = "linux")]
 pub fn attach_tls_ulp(fd: RawFd) -> Result<(), KtlsError> {
     let ulp = b"tls";
+    // SAFETY: `setsockopt` only reads `ulp.len()` bytes from the live static
+    // buffer; an invalid `fd` yields EBADF, handled as an error below.
     let rc = unsafe {
         libc::setsockopt(
             fd,
@@ -483,6 +488,9 @@ fn install_direction(
         salt: secrets.salt,
         rec_seq: secrets.rec_seq,
     };
+    // SAFETY: `info` is a live, fully-initialized `#[repr(C)]` struct and the
+    // length passed is exactly its size; the kernel only reads it. The transient
+    // key copy inside it is zeroized immediately after, on every path.
     let rc = unsafe {
         libc::setsockopt(
             fd,
@@ -577,6 +585,9 @@ pub fn install_ktls_keys(fd: RawFd, keys: &KtlsDuplexKeys) -> Result<(), KernelN
 /// `close` releases the fd.
 #[cfg(target_os = "linux")]
 fn fail_closed_shutdown(fd: RawFd) {
+    // SAFETY: the bridge owns `fd` at this point (ownership was transferred in
+    // via `into_raw_fd`); it is shut down and closed exactly once, here, and
+    // never used afterwards. Errors are irrelevant — the socket is being killed.
     unsafe {
         libc::shutdown(fd, libc::SHUT_RDWR);
         libc::close(fd);
@@ -585,6 +596,7 @@ fn fail_closed_shutdown(fd: RawFd) {
 
 #[cfg(not(target_os = "linux"))]
 fn fail_closed_shutdown(fd: RawFd) {
+    // SAFETY: as above — sole owner, closed exactly once, never reused.
     unsafe {
         libc::close(fd);
     }

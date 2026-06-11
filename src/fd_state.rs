@@ -283,6 +283,7 @@ impl FdState {
 }
 
 pub fn current_pid() -> c_int {
+    // SAFETY: getpid takes no arguments, touches no memory, and cannot fail.
     unsafe { libc::getpid() }
 }
 
@@ -425,11 +426,14 @@ fn config_reloader_loop() {
 
 #[cfg(target_os = "linux")]
 fn watch_config_dir_once() -> io::Result<()> {
+    // SAFETY: inotify_init1 takes only a flag word and returns a new fd or -1.
     let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     let result = watch_config_dir_fd(fd);
+    // SAFETY: `fd` was created above, is owned solely by this function, and is
+    // closed exactly once here.
     unsafe {
         raw_close(fd);
     }
@@ -441,6 +445,8 @@ fn watch_config_dir_fd(fd: c_int) -> io::Result<()> {
     let path = std::ffi::CString::new(CONFIG_DIR)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid config path"))?;
     let mask = libc::IN_CLOSE_WRITE | libc::IN_MODIFY | libc::IN_MOVED_TO;
+    // SAFETY: `path` is a live NUL-terminated CString and `fd` is the caller's
+    // valid inotify descriptor; the kernel only reads the path bytes.
     let wd = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), mask) };
     if wd < 0 {
         return Err(io::Error::last_os_error());
@@ -448,6 +454,8 @@ fn watch_config_dir_fd(fd: c_int) -> io::Result<()> {
 
     let mut buf = [0u8; 4096];
     loop {
+        // SAFETY: `buf` is a live 4096-byte local and `len` is its exact size;
+        // the kernel writes at most `len` bytes into it.
         let n = unsafe { raw_read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             let err = io::Error::last_os_error();
@@ -465,7 +473,15 @@ fn watch_config_dir_fd(fd: c_int) -> io::Result<()> {
         let mut offset = 0usize;
         let total = n as usize;
         while offset + mem::size_of::<libc::inotify_event>() <= total {
-            let event = unsafe { &*(buf[offset..].as_ptr().cast::<libc::inotify_event>()) };
+            // SAFETY: the loop condition guarantees at least size_of::<inotify_event>()
+            // readable bytes at `offset` inside `buf`. `read_unaligned` copies the
+            // header out by value, so no reference is formed to potentially
+            // misaligned memory ([u8; 4096] has alignment 1; the kernel aligns
+            // successive events, but the buffer base itself carries no guarantee —
+            // taking `&*cast` here would be UB on a misaligned base).
+            let event = unsafe {
+                std::ptr::read_unaligned(buf[offset..].as_ptr().cast::<libc::inotify_event>())
+            };
             let name_start = offset + mem::size_of::<libc::inotify_event>();
             let name_end = name_start.saturating_add(event.len as usize);
             if name_end > total {
@@ -479,11 +495,21 @@ fn watch_config_dir_fd(fd: c_int) -> io::Result<()> {
     }
 }
 
+/// Raw `read(2)` via `syscall`, bypassing the interposed libc `read` (the
+/// overlay's own LD_PRELOAD hook must not recurse into this watcher).
+///
+/// # Safety
+/// `buf` must be valid for writes of `len` bytes and `fd` must be a readable
+/// descriptor owned by the caller.
 #[cfg(target_os = "linux")]
 unsafe fn raw_read(fd: c_int, buf: *mut libc::c_void, len: usize) -> isize {
     libc::syscall(libc::SYS_read, fd, buf, len) as isize
 }
 
+/// Raw `close(2)` via `syscall`, bypassing the interposed libc `close`.
+///
+/// # Safety
+/// `fd` must be owned by the caller and not used again after this call.
 #[cfg(target_os = "linux")]
 unsafe fn raw_close(fd: c_int) {
     libc::syscall(libc::SYS_close, fd);

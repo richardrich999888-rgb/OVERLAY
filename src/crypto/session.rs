@@ -355,8 +355,11 @@ impl SecureSession {
                 return Err(SessionError::Replay);
             }
             Ok(pt)
-        } else if epoch + 1 == self.epoch {
+        } else if self.epoch > 0 && epoch == self.epoch - 1 {
             // In-flight record from the previous epoch (one-step grace).
+            // NB: compare against our OWN (trusted, bounded) epoch minus one —
+            // never `epoch + 1`, since `epoch` is attacker-controlled and
+            // `0xFFFF_FFFF + 1` would overflow-panic (a fuzzer-found fail-open).
             let prev = self.rx_prev.as_ref().ok_or(SessionError::EpochMismatch)?;
             if !self.rx_prev_window.is_fresh(seq) {
                 return Err(SessionError::Replay);
@@ -578,6 +581,29 @@ mod tests {
         std::thread::sleep(Duration::from_millis(45));
         assert_eq!(a.state(), SessionState::Expired);
         assert_eq!(a.seal(b"late"), Err(SessionError::Expired));
+    }
+
+    /// Regression (fuzzer-found): a record whose attacker-controlled epoch field
+    /// is `u32::MAX` must fail closed, not overflow-panic on the grace-epoch
+    /// comparison (`epoch + 1`). See `tests/fuzz` / session.rs:open.
+    #[test]
+    fn max_epoch_record_fails_closed_without_overflow() {
+        let (_a, mut b) = paired(SessionLimits::default());
+        // header = epoch(0xFFFFFFFF) || seq(0) || (no ciphertext needed)
+        let mut record = vec![0xFFu8; RECORD_HEADER_LEN];
+        for byte in record.iter_mut().take(EPOCH_LEN) {
+            *byte = 0xFF;
+        }
+        // seq bytes = 0
+        for byte in record.iter_mut().skip(EPOCH_LEN) {
+            *byte = 0x00;
+        }
+        record.extend_from_slice(&[0u8; 16]); // arbitrary "ciphertext"
+                                              // Must return an Err, never panic.
+        assert!(matches!(
+            b.open(&record),
+            Err(SessionError::EpochMismatch) | Err(SessionError::Crypto(_))
+        ));
     }
 
     #[test]

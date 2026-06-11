@@ -62,6 +62,9 @@ rand = "=0.8.6"
 libc = "=0.2.168"
 # Over-socket handshake tests drive a loopback pair with two async tasks.
 tokio = { version = "=1.43.0", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+# Exhaustive concurrency model-checking of the PQC-permit accounting
+# (tests/loom_model.rs). Dev-only: never linked into the shipped .so.
+loom = "=0.7.2"
 
 [features]
 # Compile + link the C-DAC ParaS (SYCL 2020) offload bridge (host-fallback via

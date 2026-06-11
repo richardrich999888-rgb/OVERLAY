@@ -27,7 +27,7 @@ yet backed by committed evidence.
 |---|---|---|---|---|
 | **C6** | Handshake-flood CPU exhaustion: PQC work performed before peer validation | High → **Low** | **Mitigated — gate on the real daemon path; per-source + global caps; validated in-process, on the wire, and against the spawned daemon** | `docs/HANDSHAKE_DOS_HARDENING.md`; `src/handshake_guard.rs`; `src/bin/daemon.rs`; `src/over_socket.rs`; `tests/handshake_dos_tests.rs`, `tests/handshake_dos_integration.rs`, `tests/chaos_orchestration.rs` |
 | (PQC-2) | Long-session key-wear, no anti-replay/rekey on lossy links | Med | **Mitigated (record layer implemented + tested)** | `docs/PQC_PROTOCOL_SPEC.md §4`; `src/crypto/session.rs`; `tests/session_hardening_tests.rs` |
-| **FC-1** | Fail-closed assurance gap: no automated proof of no-cleartext / no-panic / concurrency safety; 85/86 `unsafe` blocks undocumented | High → **Low–Medium** | **Mitigated in-sandbox (property + concurrency proof, unsafe audit, lint hardening); Miri/Loom/fuzz committed but blocked-on-nightly** | `docs/FAIL_CLOSED_VALIDATION.md`; `tests/fail_closed_properties.rs`, `tests/concurrency_stress.rs`; `src/lib.rs` (`#![deny(unused_must_use)]`); `fuzz/`, `scripts/run_miri.sh` |
+| **FC-1** | Fail-closed assurance gap: no automated proof of no-cleartext / no-panic / concurrency safety; 85/86 `unsafe` blocks undocumented; a misaligned-reference UB in the config watcher | High → **Low** | **Mitigated + validated here: property + leakage + concurrency proof, panic-path & unsafe audit (1 UB bug fixed), and Miri + Loom + cargo-fuzz all run on a nightly toolchain** | `docs/FAIL_CLOSED_ASSURANCE.md`; `tests/fail_closed_properties.rs`, `tests/concurrency_stress.rs`, `tests/leakage_analysis.rs`, `tests/loom_model.rs`; `scripts/run_miri.sh`, `fuzz/`; `src/lib.rs` (`#![deny(unused_must_use)]`) |
 | C1–C5, C7 | Universal interception (eBPF), identity lifecycle (TPM/HSM/air-gap), resilience (`tc netem`), sovereign/ARM | — | **Open / tracked** | Not runnable in the current sandbox; host-only / future increments (see §4) |
 
 > The original review's full C-series text was a chat-only artifact. Rather than
@@ -178,17 +178,24 @@ fail-open-class lint is enforced crate-wide:
 | No deadlock / no slot leak | 12 threads × 5 000 | **final in-flight = 0** |
 | Poisoned guard | production `.lock()` pattern | **fail-closed error, no panic** |
 
-**Honest boundary (blocked-on-infra).** Miri (UB), Loom (exhaustive interleaving),
-and cargo-fuzz (continuous fuzzing) need a **nightly** toolchain absent from this
-sandbox. Real harnesses are committed (`fuzz/`, `scripts/run_miri.sh`) and run on a
-host; they are **not** claimed as validated here. The in-sandbox property + stress
-suites bound, but do not replace, them.
+**Tooling update — now run here.** A nightly toolchain, `miri`, `loom`, and
+`cargo-fuzz` were obtained and **executed in this environment** (the earlier
+"blocked-on-nightly" boundary is retired):
+- **Miri**: 12 pure-logic tests, **0 undefined behaviour** (after fixing the
+  `fd_state.rs` misaligned-reference UB the audit surfaced).
+- **Loom**: exhaustive interleaving proof of the PQC-permit cap (3 tests incl. a
+  TOCTOU negative control that Loom correctly catches), **0.65 s**.
+- **cargo-fuzz**: four libFuzzer targets over the parsers + responder (ASan).
+  ~10.8M execs on the parser targets clean; **found and fixed a real fail-open
+  bug** — an integer-overflow panic in `SecureSession::open` on a record whose
+  attacker-controlled epoch was `0xFFFF_FFFF` (regression-tested, re-fuzzed clean).
+Full report: `docs/FAIL_CLOSED_ASSURANCE.md`.
 
-**Readiness impact.** FC-1 moves **High → Low–Medium**. The fail-open and
-crash-on-input failure modes are now disproven across hundreds of thousands of
-adversarial inputs and real-thread interleavings; residual is the absence of a
-*nightly CI runner* for UB/exhaustive/continuous proof (R2 in the report), not an
-unaddressed code weakness.
+**Readiness impact.** FC-1 moves **High → Low**. The fail-open and
+crash-on-input failure modes are disproven across hundreds of thousands of
+adversarial inputs, exhaustive concurrency interleavings, and a clean Miri UB
+pass; a real UB bug was found and fixed. Residual is the absence of a *nightly CI
+lane* to run Miri/Loom/fuzz per-PR (R2), not an unaddressed code weakness.
 
 ## 3. Delivered hardening increments (this branch)
 
@@ -225,11 +232,10 @@ not be read as validated:
 - **Identity lifecycle** (enrolment/rotation/revocation/expiry, TPM2/PKCS#11/HSM,
   air-gap provisioning).
 - **Sovereign ARM64** hardware validation.
-- **Miri / Loom / cargo-fuzz** (UB detection, exhaustive interleaving proof,
-  continuous fuzzing) for FC-1 — require a **nightly** toolchain; real harnesses
-  are committed (`fuzz/`, `scripts/run_miri.sh`) and run on a host (see
-  `docs/FAIL_CLOSED_VALIDATION.md §6`). The in-sandbox property + concurrency
-  suites are the deterministic stand-in that *is* validated here.
+
+> Note: Miri / Loom / cargo-fuzz (FC-1) are **no longer** on this list — they were
+> run here on a nightly toolchain (see §2A and `docs/FAIL_CLOSED_ASSURANCE.md`).
+> The remaining gap is a *nightly CI lane* to run them per-PR, not the tools.
 - **Formal fail-closed assurance** (Miri/Loom/fuzzing/property-model-checking).
 
 ---
@@ -243,9 +249,11 @@ cargo build --release --locked
 cargo test --release --locked
 cargo test --test handshake_dos_tests --test handshake_dos_integration \
            --test session_hardening_tests -- --nocapture
-cargo test --test fail_closed_properties --test concurrency_stress -- --nocapture
+cargo test --test fail_closed_properties --test concurrency_stress \
+           --test leakage_analysis -- --nocapture
 cargo test --test chaos_orchestration     # spawns the real daemon binary
-# host-only (nightly): scripts/run_miri.sh ; cargo +nightly fuzz run cookie_parse
+# nightly (validated here): scripts/run_miri.sh ; cargo test --test loom_model --release ;
+#                           cargo +nightly fuzz run cookie_parse -- -max_total_time=60
 ```
 
 All gates pass in this environment at the current HEAD.

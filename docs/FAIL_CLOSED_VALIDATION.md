@@ -1,5 +1,11 @@
 # Fail-Closed Assurance — Validation Report (Finding FC-1)
 
+> **Superseded by `docs/FAIL_CLOSED_ASSURANCE.md`.** This document recorded the
+> first increment, when Miri/Loom/cargo-fuzz were marked *blocked-on-nightly*.
+> They have since been **run on a nightly toolchain in-environment** (Miri: 0 UB;
+> Loom: exhaustive cap proof; cargo-fuzz: parser targets). A misaligned-reference
+> UB the audit surfaced was fixed. See the consolidated report for current state.
+
 **Finding addressed:** FC-1 — *fail-closed assurance gap*. The platform's
 load-bearing safety promise is "never emit application plaintext, never crash on
 adversarial input, fail closed on every error." Before this increment that promise

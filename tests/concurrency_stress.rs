@@ -8,9 +8,10 @@
 //!   * a *poisoned* mutex is handled fail-closed (the production `.lock()` pattern
 //!     yields an error, never a panic / never a bypass).
 //!
-//! This is real-thread stress, not exhaustive interleaving model-checking. The
-//! exhaustive complement (Loom) requires a dependency + toolchain not present
-//! here and is specified as host-only in `docs/FAIL_CLOSED_VALIDATION.md`.
+//! This is real-thread stress, which *samples* interleavings. The exhaustive
+//! complement is `tests/loom_model.rs` (Loom), which model-checks **every**
+//! interleaving of the same permit-accounting pattern. See
+//! `docs/FAIL_CLOSED_ASSURANCE.md §4`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};

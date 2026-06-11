@@ -7,3 +7,10 @@ tests/__pycache__/
 # Mininet range runtime artifacts
 benchmarks/mininet_local_range/raw_logs.txt
 *.pcap
+
+# cargo-fuzz generated artifacts (host-only; not committed)
+/fuzz/Cargo.lock
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
