@@ -22,6 +22,7 @@ pub mod crypto;
 pub mod fd_passing;
 pub mod fd_state;
 pub mod handshake_guard;
+pub mod identity;
 // The interceptor's whole purpose is exporting `#[no_mangle]` libc symbol
 // overrides (write/read/close/...). Under Miri those clash with the
 // interpreter's built-in libc shims, so the module is compiled out for Miri

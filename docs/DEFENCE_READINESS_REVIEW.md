@@ -28,7 +28,8 @@ yet backed by committed evidence.
 | **C6** | Handshake-flood CPU exhaustion: PQC work performed before peer validation | High → **Low** | **Mitigated — gate on the real daemon path; per-source + global caps; validated in-process, on the wire, and against the spawned daemon** | `docs/HANDSHAKE_DOS_HARDENING.md`; `src/handshake_guard.rs`; `src/bin/daemon.rs`; `src/over_socket.rs`; `tests/handshake_dos_tests.rs`, `tests/handshake_dos_integration.rs`, `tests/chaos_orchestration.rs` |
 | (PQC-2) | Long-session key-wear, no anti-replay/rekey on lossy links | Med | **Mitigated (record layer implemented + tested)** | `docs/PQC_PROTOCOL_SPEC.md §4`; `src/crypto/session.rs`; `tests/session_hardening_tests.rs` |
 | **FC-1** | Fail-closed assurance gap: no automated proof of no-cleartext / no-panic / concurrency safety; 85/86 `unsafe` blocks undocumented; a misaligned-reference UB in the config watcher | High → **Low** | **Mitigated + validated here: property + leakage + concurrency proof, panic-path & unsafe audit (1 UB bug fixed), and Miri + Loom + cargo-fuzz all run on a nightly toolchain** | `docs/FAIL_CLOSED_ASSURANCE.md`; `tests/fail_closed_properties.rs`, `tests/concurrency_stress.rs`, `tests/leakage_analysis.rs`, `tests/loom_model.rs`; `scripts/run_miri.sh`, `fuzz/`; `src/lib.rs` (`#![deny(unused_must_use)]`) |
-| C1–C5, C7 | Universal interception (eBPF), identity lifecycle (TPM/HSM/air-gap), resilience (`tc netem`), sovereign/ARM | — | **Open / tracked** | Not runnable in the current sandbox; host-only / future increments (see §4) |
+| **IL-1** | No identity lifecycle: peer keys statically pinned, never enrolled/rotated/revoked/expired | High → **Low–Medium** | **Mitigated: hybrid-PQC credential system (enrollment+PoP, issuance, rotation, revocation, expiry, offline) implemented + tested, and shown driving the real handshake; TPM2/PKCS#11/HSM evaluated as design with infra plan** | `docs/IDENTITY_LIFECYCLE.md`; `src/identity.rs`; `tests/identity_lifecycle_tests.rs` |
+| C1–C5, C7 | Universal interception (eBPF), resilience (`tc netem`), sovereign/ARM | — | **Open / tracked** | Not runnable in the current sandbox; host-only / future increments (see §4) |
 
 > The original review's full C-series text was a chat-only artifact. Rather than
 > restate findings whose details are not yet backed by committed evidence, this
@@ -211,11 +212,18 @@ lane* to run Miri/Loom/fuzz per-PR (R2), not an unaddressed code weakness.
    spawned daemon binary. This document, §2.
 3. **Fail-closed assurance (FC-1).** Automated property + concurrency proof of the
    no-cleartext / no-panic / cap-never-exceeded invariants, unsafe-code audit, and
-   `#![deny(unused_must_use)]` lint hardening; Miri/Loom/fuzz harnesses committed
-   host-only. This document, §2A.
+   `#![deny(unused_must_use)]` lint hardening; Miri + Loom + cargo-fuzz run on a
+   nightly toolchain (2 real bugs found + fixed). This document, §2A.
+4. **Identity lifecycle (IL-1).** Hybrid-PQC credential system — enrollment with
+   proof-of-possession, issuance, rotation (overlapping validity), CRL revocation,
+   expiry, and offline/air-gap provisioning — implemented, tested, and shown
+   producing the peer keys that drive the real handshake. TPM2/PKCS#11/HSM
+   evaluated behind a `HybridSigner` trait with an infra-gated validation plan and
+   the honest PQC caveat (hardware protects the classical key; ML-DSA stays
+   software-side until PQC-capable HSMs ship). `docs/IDENTITY_LIFECYCLE.md`.
 
-All three are pure-Rust, fully tested in-sandbox, and add no packages to the main
-dependency tree.
+All are pure-Rust, fully tested in-sandbox, and add no packages to the main
+dependency tree (identity reuses the existing Ed25519 + ML-DSA primitives).
 
 ---
 
@@ -229,9 +237,10 @@ not be read as validated:
   (no `bpf-linker`/`tc`/CAP_BPF here).
 - **`tc netem` 10/20/30/45% loss** at the kernel qdisc level (the record-layer
   loss numbers above use an in-process model, clearly labelled as such).
-- **Identity lifecycle** (enrolment/rotation/revocation/expiry, TPM2/PKCS#11/HSM,
-  air-gap provisioning).
 - **Sovereign ARM64** hardware validation.
+- **Hardware-backed identity keys** (TPM2/PKCS#11/HSM) — the lifecycle *software*
+  path is validated (IL-1); the hardware backends need `swtpm`/SoftHSM2 (CI) or a
+  real TPM/HSM and are design + plan only here (`docs/IDENTITY_LIFECYCLE.md §4`).
 
 > Note: Miri / Loom / cargo-fuzz (FC-1) are **no longer** on this list — they were
 > run here on a nightly toolchain (see §2A and `docs/FAIL_CLOSED_ASSURANCE.md`).
@@ -251,6 +260,7 @@ cargo test --test handshake_dos_tests --test handshake_dos_integration \
            --test session_hardening_tests -- --nocapture
 cargo test --test fail_closed_properties --test concurrency_stress \
            --test leakage_analysis -- --nocapture
+cargo test --lib identity --test identity_lifecycle_tests -- --nocapture
 cargo test --test chaos_orchestration     # spawns the real daemon binary
 # nightly (validated here): scripts/run_miri.sh ; cargo test --test loom_model --release ;
 #                           cargo +nightly fuzz run cookie_parse -- -max_total_time=60
