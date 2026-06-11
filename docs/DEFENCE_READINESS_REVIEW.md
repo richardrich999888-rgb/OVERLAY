@@ -29,7 +29,8 @@ yet backed by committed evidence.
 | (PQC-2) | Long-session key-wear, no anti-replay/rekey on lossy links | Med | **Mitigated (record layer implemented + tested)** | `docs/PQC_PROTOCOL_SPEC.md §4`; `src/crypto/session.rs`; `tests/session_hardening_tests.rs` |
 | **FC-1** | Fail-closed assurance gap: no automated proof of no-cleartext / no-panic / concurrency safety; 85/86 `unsafe` blocks undocumented; a misaligned-reference UB in the config watcher | High → **Low** | **Mitigated + validated here: property + leakage + concurrency proof, panic-path & unsafe audit (1 UB bug fixed), and Miri + Loom + cargo-fuzz all run on a nightly toolchain** | `docs/FAIL_CLOSED_ASSURANCE.md`; `tests/fail_closed_properties.rs`, `tests/concurrency_stress.rs`, `tests/leakage_analysis.rs`, `tests/loom_model.rs`; `scripts/run_miri.sh`, `fuzz/`; `src/lib.rs` (`#![deny(unused_must_use)]`) |
 | **IL-1** | No identity lifecycle: peer keys statically pinned, never enrolled/rotated/revoked/expired | High → **Low–Medium** | **Mitigated: hybrid-PQC credential system (enrollment+PoP, issuance, rotation, revocation, expiry, offline) implemented + tested, and shown driving the real handshake; TPM2/PKCS#11/HSM evaluated as design with infra plan** | `docs/IDENTITY_LIFECYCLE.md`; `src/identity.rs`; `tests/identity_lifecycle_tests.rs` |
-| C1–C5, C7 | Universal interception (eBPF), resilience (`tc netem`), sovereign/ARM | — | **Open / tracked** | Not runnable in the current sandbox; host-only / future increments (see §4) |
+| **C1** | LD_PRELOAD interception is incomplete (static/Go/musl/direct-syscall bypass it) | High → **Low** | **Replaced with a kernel `cgroup/connect4` eBPF data plane, built+loaded+attached+measured: 7/7 runtimes intercepted incl. the 4 LD_PRELOAD blind spots; fail-closed deny enforced (EPERM)** | `docs/UNIVERSAL_INTERCEPTION.md`; `ebpf/c/`, `ebpf/COVERAGE_REPORT.txt`; `scripts/ebpf_coverage_validate.sh` |
+| C2–C5, C7 | Resilience (`tc netem`), sovereign/ARM, et al. | — | **Open / tracked** | host-only / future increments (see §4) |
 
 > The original review's full C-series text was a chat-only artifact. Rather than
 > restate findings whose details are not yet backed by committed evidence, this
@@ -222,8 +223,15 @@ lane* to run Miri/Loom/fuzz per-PR (R2), not an unaddressed code weakness.
    the honest PQC caveat (hardware protects the classical key; ML-DSA stays
    software-side until PQC-capable HSMs ship). `docs/IDENTITY_LIFECYCLE.md`.
 
-All are pure-Rust, fully tested in-sandbox, and add no packages to the main
-dependency tree (identity reuses the existing Ed25519 + ML-DSA primitives).
+5. **Universal interception (C1).** A kernel `cgroup/connect4` eBPF data plane
+   replacing LD_PRELOAD — built, loaded, attached, and **measured** on a BPF-capable
+   host (kernel 6.18): one program intercepted glibc/static-glibc/Go/Rust/
+   rust-musl/direct-syscall/python (7/7, incl. the 4 cases LD_PRELOAD cannot see)
+   and enforced a fail-closed `EPERM` deny. `docs/UNIVERSAL_INTERCEPTION.md`,
+   `ebpf/COVERAGE_REPORT.txt`.
+
+The Rust crate is pure-Rust and adds no packages to the main dependency tree; the
+eBPF data plane is out-of-tree C+libbpf (built by clang, not part of `cargo build`).
 
 ---
 
@@ -233,8 +241,11 @@ These require provisioned hardware/toolchains absent from this sandbox and are
 tracked as host-only or future increments; they are **[design]** here and must
 not be read as validated:
 
-- **Universal eBPF interception** across glibc/musl/static/Go/containers/K8s
-  (no `bpf-linker`/`tc`/CAP_BPF here).
+- **eBPF interception on Kubernetes / IPv6 / UDP.** The `cgroup/connect4` data
+  plane is **measured** for TCP IPv4 across 7 runtimes on a single host (C1, no
+  longer on this list for the host case). Still **[design]**: per-pod K8s attach,
+  `connect6` (IPv6), `sendmsg4` (UDP), and a privileged BPF CI lane
+  (`docs/UNIVERSAL_INTERCEPTION.md §5`).
 - **`tc netem` 10/20/30/45% loss** at the kernel qdisc level (the record-layer
   loss numbers above use an in-process model, clearly labelled as such).
 - **Sovereign ARM64** hardware validation.
