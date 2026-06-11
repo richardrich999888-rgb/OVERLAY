@@ -25,7 +25,7 @@ use syntriass_overlay::crypto::{
     FALLBACK_NONCE_LEN, FALLBACK_PSK_LEN,
 };
 use syntriass_overlay::kernel_native::{select_posture, AvailabilityPosture};
-use syntriass_overlay::over_socket::initiator_handshake;
+use syntriass_overlay::over_socket::gated_initiator_handshake;
 
 const SUITE: CipherSuite = CipherSuite::NistStandard768;
 /// A plaintext marker that must NEVER appear on the wire.
@@ -72,7 +72,7 @@ async fn client_handshake(port: u16, id: &IdentityMaterial) -> Result<(), String
     let mut s = TcpStream::connect(("127.0.0.1", port))
         .await
         .map_err(|e| format!("connect: {e}"))?;
-    initiator_handshake(&mut s, id, SUITE)
+    gated_initiator_handshake(&mut s, id, SUITE)
         .await
         .map(|_| ())
         .map_err(|e| format!("handshake: {e}"))

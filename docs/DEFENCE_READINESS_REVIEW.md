@@ -25,7 +25,7 @@ yet backed by committed evidence.
 
 | ID | Finding (summary) | Severity | Status | Evidence |
 |---|---|---|---|---|
-| **C6** | Handshake-flood CPU exhaustion: PQC work performed before peer validation | High | **Mitigated (gate implemented + tested); live-wire integration [design]** | `docs/HANDSHAKE_DOS_HARDENING.md`; `src/handshake_guard.rs`; `tests/handshake_dos_tests.rs` |
+| **C6** | Handshake-flood CPU exhaustion: PQC work performed before peer validation | High → **Low** | **Mitigated — gate on the real daemon path; per-source + global caps; validated in-process, on the wire, and against the spawned daemon** | `docs/HANDSHAKE_DOS_HARDENING.md`; `src/handshake_guard.rs`; `src/bin/daemon.rs`; `src/over_socket.rs`; `tests/handshake_dos_tests.rs`, `tests/handshake_dos_integration.rs`, `tests/chaos_orchestration.rs` |
 | (PQC-2) | Long-session key-wear, no anti-replay/rekey on lossy links | Med | **Mitigated (record layer implemented + tested)** | `docs/PQC_PROTOCOL_SPEC.md §4`; `src/crypto/session.rs`; `tests/session_hardening_tests.rs` |
 | C1–C5, C7+ | Universal interception, identity lifecycle, resilience (`tc netem`), sovereign/ARM, formal fail-closed (Miri/Loom/fuzz) | — | **Open / tracked** | Not runnable in the current sandbox; scoped as host-only / future increments (see §4) |
 
@@ -52,33 +52,46 @@ deny service to an entire SYNTRIASS-protected enclave by starving the responder
 daemon of CPU — a critical availability failure for a tactical system whose whole
 value proposition is assured communications under contested conditions.
 
-### 2.2 What was implemented
+### 2.2 Before state vs integrated state
 
-A two-phase **stateless-cookie admission gate** (`src/handshake_guard.rs`) that
-makes the PQC path unreachable until the peer proves return-routability and
-passes cheap, constant-time checks, with per-source rate limiting and replay
-resistance. Full design in `docs/HANDSHAKE_DOS_HARDENING.md`. Key points:
+| Aspect | **Before** (original finding) | **Before** (first increment) | **Integrated (now)** |
+|---|---|---|---|
+| PQC reachable without peer proof? | **Yes** — per ClientHello | No (gate object), but gate not on the wire | **No — gate runs in the daemon accept loop** |
+| Cookie binding | n/a | caller-supplied `source` string | **kernel-observed peer IP** (`peer_addr().ip()`) |
+| Per-source rate limit | none | yes (library) | yes, **per peer IP**, on the live path |
+| Aggregate (distributed) cap | none | none | **global PQC-rate + in-flight concurrency caps** |
+| Validation | n/a | in-process PQC counts | in-process **+ on-the-wire + spawned-daemon** |
 
-- **Return-routability before PQC.** Cookie = `HMAC-SHA256(rotating secret,
-  label ‖ source ‖ issued_at ‖ nonce)`, issued statelessly (one HMAC, no
-  per-connection state) and bound to the source. The caller runs `respond()`
-  **only** after `admit()` returns `Ok`. **[implemented]**
-- **Per-source token-bucket rate limiting**, with the source-key and bucket-map
-  size both bounded (no memory-exhaustion side door). **[implemented]**
+### 2.3 What was implemented (integrated)
+
+A two-phase **stateless-cookie admission gate** (`src/handshake_guard.rs`),
+**wired into the live daemon** (`src/bin/daemon.rs` →
+`over_socket::establish_and_bridge_gated`) for every accepted connection. Full
+design in `docs/HANDSHAKE_DOS_HARDENING.md`. Key points:
+
+- **Return-routability before PQC, on the real path.** Cookie =
+  `HMAC-SHA256(rotating secret, label ‖ peer-IP ‖ issued_at ‖ nonce)`, issued
+  statelessly. The daemon runs `respond()` **only** after `admit()` *and* the
+  global gate both pass. **[implemented]**
+- **Cookie bound to the live peer identity** — the kernel-reported peer IP, keyed
+  on IP (not ip:port) so fresh ephemeral ports cannot bypass limits. **[implemented]**
+- **Global PQC-work + concurrency limits** (`try_acquire_pqc`) complementing the
+  per-source bucket: a single all-sources rate bucket + an in-flight cap with an
+  RAII permit that releases on every exit path. Bounds a *distributed* flood.
+  **[implemented]**
 - **Replay resistance**: freshness window + constant-time MAC
   (`subtle::ConstantTimeEq`) + one-time consumed-tag set (pruned + capped).
-  **[implemented]**
 - **No new dependencies** (`hmac`, `subtle` were already transitive).
 
-### 2.3 Evidence (reproducible)
+### 2.4 Evidence (reproducible)
 
 ```
-cargo test --lib handshake_guard            # 12 unit tests
-cargo test --test handshake_dos_tests -- --nocapture   # 6 tests vs the REAL responder
+cargo test --lib handshake_guard                                   # 16 unit tests
+cargo test --test handshake_dos_tests --test handshake_dos_integration -- --nocapture
+cargo test --test chaos_orchestration                             # spawns the real daemon
 ```
 
-Counting **real** `crypto::generic::respond()` (ML-KEM + X25519 + ML-DSA-65)
-invocations, **[measured]** this run:
+**In-process, counting real `respond()` invocations** (**[measured]**):
 
 | Attack | Volume | PQC invocations |
 |---|---:|---:|
@@ -86,32 +99,47 @@ invocations, **[measured]** this run:
 | Spoofed-source flood | 20 000 sources | **0** |
 | Malformed messages | 6 000 | **0** |
 | Replayed handshake | 10 000 submissions | **1** |
-| Legitimate flood (rate 20/10s⁻¹) | 1 000 attempts | **20** (rate-capped) |
-| Mixed assault + 3 honest sources | 100 000 nuisance | **15** (honest only) |
+| Legitimate flood (rate 20/10s⁻¹) | 1 000 attempts | **20** (per-source cap) |
+| **Distributed flood, 5 000 distinct sources** | 5 000 sources | **25** (= global burst) |
 
-The asymmetric-work primitive is removed: junk and spoofed floods do **zero** PQC;
-replays do at most one; legitimate load is capped to the per-source budget, not
-amplified per packet. Memory stays within configured caps under six-figure floods.
+**On the real wire, through the gated daemon path** (**[measured]**):
 
-### 2.4 Residual risk and revised severity
+| Scenario | Connections | Reached PQC | Rejected at gate |
+|---|---:|---:|---|
+| Genuine peers | 3 | **3** | 0 |
+| Forged-cookie flood | 10 | **0** | 10 `BadMac` |
+| Replayed cookie | 1 + 5 | **1** | 5 `Replay` |
+| Concurrent load (global burst 5) | 40 | **5** | 35 globally shed |
+
+Plus end-to-end against the **spawned daemon binary**
+(`chaos_orchestration::daemon_context_kill_fails_closed`): real gated handshakes
+complete while the daemon lives and fail closed when it is killed.
+
+### 2.5 Residual risk and revised severity
 
 Residual risks (detailed in `docs/HANDSHAKE_DOS_HARDENING.md §6`):
 
-- **R1 distributed return-routable (botnet) flood** — per-source limiting does
-  not cap aggregate admitted load; a global concurrency/PQC-rate cap is **[design]**.
-- **R2 cookie issuance is still a per-packet HMAC** — ~3–4 orders of magnitude
-  cheaper than the ML-DSA-65 signing it replaces; line-rate floods should sit
-  behind kernel/eBPF ingress controls.
-- **R4 not yet wired into `daemon.rs`** — guarantees proven for the gate and
-  against the real responder in tests; live-wire integration is **[design]**.
+- **R1 distributed botnet flood** — the global rate + concurrency caps now bound
+  *aggregate* PQC work (the responder can no longer be CPU-exhausted). Residual is
+  a **fairness** concern: legitimate peers compete for the global budget under a
+  large flood (they retry). Priority/allow-listing + eBPF ingress controls are
+  **[design]**.
+- **R2 cookie issuance is a per-packet HMAC** — ~3–4 orders of magnitude cheaper
+  than the ML-DSA-65 it replaces; line-rate packet floods belong behind kernel/eBPF
+  ingress controls.
+- **R3 clock dependence** — uses a monotonic seconds clock that cannot run backward.
+- **R4 shared-guard `Mutex`** — held only briefly, never across `await` or PQC, so
+  it does not serialise the expensive work; a sharded guard is a future optimisation.
+- **R5 eBPF event-source transport** — the gate covers the TCP-accept and
+  fd-passing paths; the out-of-tree eBPF RingBuf transport will reuse the same
+  contract when built (**[design]**).
 
-**Revised severity: High → Low–Medium**, contingent on:
-1. wiring the gate into the live daemon accept loop (the **[design]** item), and
-2. adding the aggregate concurrency cap (R1).
-
-Until (1) lands, C6 is **"mitigation built and validated, not yet on the fielded
-path"** — an honest, defensible state for technical review, with a clear, small
-closeout path. It is **not** marked Closed.
+**Revised severity: High → Low.** The asymmetric-work DoS primitive is removed on
+the real execution path and validated in-process, on the wire, and against the
+spawned daemon. C6 is downgraded to **Low** (residual is degraded *fairness* under
+a distributed flood, not a CPU-exhaustion DoS). It is **not** marked Closed only
+because the eBPF event-source transport (R5) and the botnet-fairness controls (R1)
+remain to fully retire the residual — both tracked, neither a CPU-DoS.
 
 ---
 
@@ -122,7 +150,11 @@ closeout path. It is **not** marked Closed.
    lifecycle limits over the real handshake. Measured end-to-end at 10/20/30/45%
    loss: 100% of delivered records open exactly once, 100% of replays rejected,
    zero false accepts. See `docs/PQC_PROTOCOL_SPEC.md §4`.
-2. **Handshake DoS gate (C6).** This document, §2.
+2. **Handshake DoS gate (C6).** Stateless-cookie admission gate **on the live
+   daemon path**, binding cookies to the kernel-observed peer IP, with per-source
+   *and* global (aggregate PQC-rate + in-flight concurrency) limits. Validated
+   in-process (real `respond()` counts), on the wire (gated path), and against the
+   spawned daemon binary. This document, §2.
 
 Both are pure-Rust, fully tested in-sandbox, and add no packages to the
 dependency tree.
@@ -153,7 +185,9 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo build --release --locked
 cargo test --release --locked
-cargo test --test handshake_dos_tests --test session_hardening_tests -- --nocapture
+cargo test --test handshake_dos_tests --test handshake_dos_integration \
+           --test session_hardening_tests -- --nocapture
+cargo test --test chaos_orchestration     # spawns the real daemon binary
 ```
 
 All gates pass in this environment at the current HEAD.

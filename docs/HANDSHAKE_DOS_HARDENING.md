@@ -5,11 +5,24 @@ PQC responder performed expensive asymmetric work for every inbound ClientHello,
 before learning anything about the peer, giving an attacker an asymmetric-work
 denial-of-service primitive.
 
-**Status:** implemented and tested in this tree. Every number in §5 is a real
-outcome of the committed tests in this environment — no fabricated benchmarks.
+**Status:** **on the real daemon execution path** and tested end-to-end. The gate
+runs for every connection the daemon accepts (`src/bin/daemon.rs` →
+`over_socket::establish_and_bridge_gated`), with per-source *and* global
+(aggregate rate + concurrency) limits. Every number in §5 is a real outcome of
+the committed tests in this environment — no fabricated benchmarks.
 
 Labels: **[measured]** produced by a test here · **[implemented]** code exists and
 is tested · **[design]** specified, not built in this increment.
+
+### State transition (before → integrated)
+
+| Aspect | Before (library-only) | Integrated (now) |
+|---|---|---|
+| Where the gate runs | a `HandshakeGuard` object exercised by tests | **inside the daemon accept loop**, every connection |
+| Cookie binding | a caller-supplied `source` byte string | the **kernel-observed peer IP** (`peer_addr().ip()`), unforgeable by the client |
+| Wire protocol | gate not on the wire | a cookie round-trip precedes the ClientHello on the live socket |
+| Aggregate limits | per-source only | per-source **+ global PQC-rate + in-flight concurrency** caps |
+| Evidence | PQC-invocation counts in-process | in-process counts **plus on-the-wire** outcome classification |
 
 ---
 
@@ -113,47 +126,84 @@ bound. **[implemented]**
 Validation order is cheapest-first (freshness → MAC → replay) so the bulk of
 junk is dropped before the (still cheap) HMAC, and all of it before any PQC.
 
-### 3.5 Failure semantics
+Per-source key note: the source is now the **kernel-observed peer IP**, hashed to
+`SHA-256(IP)[..16]`. Keying on the IP (not ip:port) is deliberate — an attacker
+cannot escape per-source rate limiting or replay detection by opening connections
+from fresh ephemeral ports.
+
+### 3.5 Global PQC-work and concurrency limits (requirement 3, aggregate)
+
+Per-source limiting bounds each individual source, but a **distributed** flood
+(many distinct, individually-under-budget sources) could still aggregate into
+unbounded responder work. Two global controls, consulted *after* `admit` and
+*before* `respond()` via `try_acquire_pqc(now)`, close that gap:
+
+- **Global admitted-PQC rate** — a single all-sources token bucket
+  (`global_pqc_per_sec`, `global_pqc_burst`). Over budget → `GlobalRateLimited`.
+- **In-flight concurrency cap** — at most `max_in_flight_pqc` PQC handshakes
+  proceed at once; beyond that → `AtCapacity` (load-shed). An RAII permit
+  (`over_socket::PqcPermit`) releases the slot on every exit path, including
+  panic. **[implemented]**
+
+A connection shed by either control performs **no PQC**; a legitimate peer simply
+reconnects for a fresh cookie. Forged cookies are rejected at the MAC check
+*before* the global gate, so an attacker cannot drain the global bucket cheaply.
+
+### 3.6 Live daemon integration (requirement 1 & 2)
+
+`src/bin/daemon.rs` creates one process-wide `Arc<Mutex<HandshakeGuard>>` per
+listener and runs **every** accepted connection (both the over-socket TCP mode
+and the SCM_RIGHTS fd-passing mode) through `establish_and_bridge_gated`, which:
+
+1. derives the source from the **kernel-reported peer IP** (requirement 2);
+2. Phase 0 — `request()` (per-source rate-limit + issue cookie), sends the cookie;
+3. Phase 1 — reads `Cookie ‖ ClientHello`, runs `admit()` then `try_acquire_pqc()`;
+4. only past both gates runs `respond()` (PQC) and bridges to kTLS.
+
+The lock is held only for the synchronous gate calls, never across an `await` or
+across the PQC computation, so the gate does not serialise handshakes.
+**[implemented]** — exercised end-to-end by `tests/chaos_orchestration.rs`
+(spawns the real daemon binary) and `tests/handshake_dos_integration.rs`.
+
+### 3.7 Failure semantics
 
 Every rejection path returns an `AdmissionError` (`Throttled`, `Expired`,
-`BadMac`, `Replay`, `Malformed`) and the caller drops the connection. No path
-yields plaintext or partial key material, consistent with the overlay's
-fail-closed invariant.
+`BadMac`, `Replay`, `Malformed`, `GlobalRateLimited`, `AtCapacity`) and the caller
+drops the connection. No path yields plaintext or partial key material, consistent
+with the overlay's fail-closed invariant.
 
 ## 4. What is NOT claimed here (honesty boundary)
 
-- **[design]** Wiring the gate into the live `daemon.rs` accept loop (binding the
-  cookie to the real kernel-reported peer address and adding the Phase-0
-  round-trip to the wire protocol). The gate is implemented and unit/integration
-  tested against the real responder, but the daemon still calls `respond()`
-  directly; the integration point is specified, not yet committed.
-- **[design]** A global (cross-source) concurrency cap / load-shed for the
-  aggregate case where millions of *distinct* return-routable sources cooperate
-  (a genuine botnet). Per-source limiting bounds each source; an aggregate cap is
-  the complementary control (see residual risks).
+- The gate is wired into the daemon's **TCP accept** path and its **fd-passing**
+  path. The **eBPF RingBuf** event source remains out-of-tree (no `bpf-linker`/
+  CAP_BPF here); when that transport is built, the same `establish_and_bridge_gated`
+  contract applies — but that path is **[design]** in this sandbox.
 - No timing benchmark of the responder under load is claimed — this sandbox is
   not representative hardware, so a wall-clock "requests/sec sustained" figure
-  would be fabricated. The evidence is **operation counts** (PQC invocations),
-  which are hardware-independent and decisive for the asymmetric-work property.
+  would be fabricated. The evidence is **operation counts** (PQC invocations /
+  on-the-wire admit-vs-reject outcomes), which are hardware-independent and
+  decisive for the asymmetric-work property.
 
 ## 5. Validation evidence
 
 Reproduce:
 
 ```
-cargo test --test handshake_dos_tests -- --nocapture
 cargo test --lib handshake_guard
+cargo test --test handshake_dos_tests --test handshake_dos_integration -- --nocapture
+cargo test --test chaos_orchestration         # spawns the real daemon binary
 ```
 
-**Unit tests** (`src/handshake_guard.rs`, 12 tests, **[measured]** all pass):
-happy path; cookie wire round-trip; forged cookie → `BadMac`; cookie bound to
-source (does not transfer); replay → `Replay`; expired/future → `Expired`;
-malformed bytes → parse `None`; single-source burst throttled to capacity;
-bucket refill over time; secret rotation keeps previous epoch valid; source map
-bounded under a 10 000-source spoof flood.
+### 5.1 Unit tests (`src/handshake_guard.rs`, 16 tests, **[measured]** all pass)
 
-**Integration tests against the real PQC responder**
-(`tests/handshake_dos_tests.rs`, 6 tests, **[measured]** this run):
+Cookie wire round-trip; forged → `BadMac`; cookie does not transfer across
+sources; replay → `Replay`; expired/future → `Expired`; malformed bytes → parse
+`None`; per-source burst throttled to capacity; bucket refill; secret rotation
+keeps the previous epoch valid; source map bounded under a 10 000-source flood;
+**global rate gate caps aggregate admits across sources**; **global rate refills
+over time**; **concurrency gate caps in-flight PQC**; release is saturating.
+
+### 5.2 In-process, against the real PQC responder (`tests/handshake_dos_tests.rs`, 7 tests, **[measured]** this run)
 
 | Scenario | Attacker volume | Real PQC `respond()` invocations | Other |
 |---|---:|---:|---|
@@ -162,46 +212,73 @@ bounded under a 10 000-source spoof flood.
 | Spoofed-source flood (no return-routability) | 20 000 sources | **0** | source map ≤ cap |
 | Replayed handshake | 10 000 submissions | **1** | 9 999 `Replay` |
 | Malformed messages (6 lengths × 1 000) | 6 000 | **0** | no panic |
-| Mixed blended assault + 3 honest sources | 100 000 nuisance | **15** (only honest admits) | sources ≤ 512, replay ≤ 1024 |
+| Mixed blended assault + 3 honest sources | 100 000 nuisance | **15** (only honest) | sources ≤ 512, replay ≤ 1024 |
+| **Distributed flood, 5 000 distinct sources, global burst 25** | 5 000 sources | **25** (= global burst) | 4 975 globally shed |
 
-Decisive properties demonstrated:
+### 5.3 On the real wire, through the live gated path (`tests/handshake_dos_integration.rs`, 4 tests, **[measured]** this run)
 
-1. **Invalid, spoofed, and malformed floods drive the PQC responder exactly
-   zero times** — the asymmetric-work primitive is removed.
-2. **A replayed handshake triggers PQC at most once** — replays cannot multiply
-   work.
-3. **A legitimate flood is capped at the per-source rate budget**, not amplified
-   per packet.
-4. **Bounded memory** — the source and replay structures never exceed their
-   configured caps under 6-figure floods.
+Each test runs `over_socket::establish_and_bridge_gated` — the function the daemon
+calls — over loopback TCP, classifying whether each connection **reached the PQC
+stage** or was **rejected at the gate**:
+
+| Scenario | Connections | Reached PQC | Rejected at gate |
+|---|---:|---:|---|
+| Genuine peers (cookie round-trip + real handshake) | 3 | **3** | 0 |
+| Forged-cookie flood on the wire | 10 | **0** | 10 `BadMac` |
+| Replayed cookie (captured, reused from a new connection) | 1 + 5 | **1** | 5 `Replay` |
+| Concurrent load, global burst = 5, no refill | 40 | **5** | 35 globally shed |
+
+End-to-end against the **spawned daemon binary**: `tests/chaos_orchestration.rs`
+completes real gated handshakes while the daemon is alive and fails closed when it
+is killed (no hang, no plaintext).
+
+### 5.4 Decisive properties demonstrated
+
+1. **Invalid, spoofed, malformed, and forged-on-the-wire floods drive the PQC
+   responder exactly zero times** — the asymmetric-work primitive is removed,
+   *on the live path*.
+2. **A replayed handshake triggers PQC at most once** — in-process and on the wire.
+3. **A legitimate single-source flood is capped at the per-source rate budget.**
+4. **A distributed flood is capped at the global burst** regardless of source
+   count (25/5 000 in-process; 5/40 on the wire).
+5. **Bounded memory** — source and replay structures never exceed configured caps
+   under six-figure floods.
 
 ## 6. Residual risks
 
-- **R1 — Distributed return-routable flood (botnet).** Per-source limiting does
-  not cap *aggregate* admitted load from millions of distinct, genuinely
-  reachable sources. Mitigation (**[design]**): a global concurrency/PQC-rate cap
-  with load-shed, plus deployment behind the existing eBPF/cgroup ingress
-  controls. Tracked, not closed.
-- **R2 — Cookie issuance is itself work.** Phase 0 costs one HMAC + one RNG draw.
-  A spoofed flood still forces that per packet. HMAC-SHA256 is ~3–4 orders of
-  magnitude cheaper than the ML-DSA-65 signing it replaces, and the source map is
-  capped, so the amplification is removed; the residual constant-cost reflection
-  is the standard cookie trade-off and should sit behind kernel-level rate
-  controls for line-rate floods.
-- **R3 — Clock dependence.** Freshness uses a caller-supplied coarse clock. A
-  badly skewed clock widens/narrows the validity window. The 2s future-skew
-  allowance and current+previous secret retention bound the impact; a monotonic
-  source is assumed at deployment.
-- **R4 — Not yet on the live wire.** Until §4's daemon integration lands, these
-  guarantees hold for the gate in isolation and against the real responder in
-  tests, not yet for the fielded `daemon.rs` path.
+- **R1 — Sustained distributed return-routable flood (botnet).** The global rate +
+  concurrency caps now bound *aggregate* responder PQC work (§5.2, §5.3), so the
+  responder can no longer be CPU-exhausted. The residual is a **fairness/
+  availability** concern: under a large botnet of genuinely reachable sources, the
+  global budget is consumed and *legitimate* peers compete for the remaining
+  admissions (they retry, but may be delayed). Mitigations (**[design]**):
+  priority/allow-listing of known-good peers, and deployment behind the eBPF/cgroup
+  ingress controls. Severity reduced from "DoS" to "degraded fairness under flood".
+- **R2 — Cookie issuance is itself work.** Phase 0 costs one HMAC + one RNG draw
+  per connection. HMAC-SHA256 is ~3–4 orders of magnitude cheaper than the
+  ML-DSA-65 signing it replaces, and the source map is capped; for line-rate
+  packet floods this constant-cost reflection should still sit behind kernel/eBPF
+  ingress rate controls. Standard cookie trade-off.
+- **R3 — Clock dependence.** Freshness uses a coarse monotonic clock
+  (`monotonic_secs`, derived from a process-start `Instant`, so it cannot run
+  backwards). The 2 s future-skew allowance and current+previous secret retention
+  bound the impact of rotation boundaries.
+- **R4 — Mutex on the shared guard.** All gate calls take a process-wide `Mutex`
+  briefly (never across `await` or PQC). At extreme connection rates this lock is
+  a potential contention point; it is **not** held during PQC, so it does not
+  serialise the expensive work. A sharded/lock-free guard is a future optimisation
+  (**[design]**), not a correctness issue.
+- **R5 — eBPF event-source transport.** The gate covers the TCP-accept and
+  fd-passing paths; the out-of-tree eBPF RingBuf transport will use the same
+  `establish_and_bridge_gated` contract when built (**[design]** here).
 
 ## 7. Test ↔ requirement traceability
 
 | Requirement | Test(s) |
 |---|---|
-| 1. Stateless cookie | `cookie_round_trips_through_wire`, `secret_rotation_keeps_previous_epoch_valid` |
-| 2. PQC gated on return-routability | `invalid_handshake_flood_triggers_zero_pqc`, `spoofed_source_flood_triggers_zero_pqc`, `cookie_bound_to_source_does_not_transfer` |
-| 3. Per-source rate limiting | `rate_limiter_throttles_a_single_source_burst`, `rate_limiter_refills_over_time`, `legitimate_flood_is_capped_by_rate_budget_not_per_packet` |
-| 4. Replay-resistant challenge | `replayed_cookie_is_rejected`, `replayed_handshake_triggers_pqc_at_most_once`, `expired_cookie_is_rejected`, `future_dated_cookie_is_rejected` |
-| 5. Flood / invalid / replay / malformed / exhaustion | the six `handshake_dos_tests` + `source_map_stays_bounded_under_spoofed_flood` |
+| 1. Integrate into the real daemon accept path | `chaos_orchestration::daemon_context_kill_fails_closed` (spawns daemon); `handshake_dos_integration::*` (the gated wire path) |
+| 2. Bind cookie to live peer identity | `handshake_dos_integration::gated_path_rejects_forged_cookie_before_pqc`, `…rejects_replayed_cookie`; `handshake_guard::cookie_bound_to_source_does_not_transfer` |
+| 3a. Per-source rate limiting | `rate_limiter_throttles_a_single_source_burst`, `…refills_over_time`, `legitimate_flood_is_capped_by_rate_budget_not_per_packet` |
+| 3b. Global PQC-work + concurrency limits | `global_rate_gate_caps_aggregate_pqc_across_sources`, `global_rate_gate_refills_over_time`, `concurrency_gate_caps_in_flight_pqc`, `distributed_source_flood_is_bounded_by_global_gate`, `handshake_dos_integration::global_gate_caps_admitted_pqc_under_concurrent_load` |
+| 4. Replay-resistant challenge | `replayed_cookie_is_rejected`, `replayed_handshake_triggers_pqc_at_most_once`, `handshake_dos_integration::gated_path_rejects_replayed_cookie`, `expired_/future_dated_cookie_is_rejected` |
+| 5. Invalid / spoofed / replay / distributed / load | the seven `handshake_dos_tests` + the four `handshake_dos_integration` wire tests |

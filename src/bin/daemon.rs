@@ -36,12 +36,26 @@
 use serde::Serialize;
 use std::env;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::sync::{Arc, Mutex};
+use syntriass_overlay::handshake_guard::{monotonic_secs, GuardConfig, HandshakeGuard};
 use syntriass_overlay::kernel_native::{
     self, configured_suite, KernelSockEvent, KernelUpcall, DEFAULT_UPCALL_SOCKET,
 };
-use syntriass_overlay::over_socket::{establish_and_bridge, HandshakeRole};
+use syntriass_overlay::over_socket::{establish_and_bridge_gated, HandshakeRole};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+
+/// Process-wide anti-DoS admission gate shared across every accepted connection
+/// (finding C6). One instance enforces the global PQC-rate + concurrency caps;
+/// per-source state lives inside it.
+type SharedGuard = Arc<Mutex<HandshakeGuard>>;
+
+fn new_shared_guard() -> SharedGuard {
+    Arc::new(Mutex::new(HandshakeGuard::new(
+        GuardConfig::default(),
+        monotonic_secs(),
+    )))
+}
 
 #[derive(Debug, Serialize)]
 struct UpcallResponse {
@@ -80,11 +94,14 @@ fn process_event_record(record: &[u8], fd: Option<RawFd>) -> UpcallResponse {
     }
 }
 
-/// Run the real over-socket hybrid handshake on a paused connection, then hand
-/// the live socket to kernel TLS. In a live v2 deployment the eBPF layer supplies
-/// the connection (the paused target socket); here the daemon's listener mode
-/// accepts it directly and plays the responder role.
-async fn serve_over_socket(stream: TcpStream, role: HandshakeRole) {
+/// Run the real over-socket hybrid handshake on a paused connection **behind the
+/// anti-DoS admission gate**, then hand the live socket to kernel TLS. In a live
+/// v2 deployment the eBPF layer supplies the connection (the paused target
+/// socket); here the daemon's listener mode accepts it directly and plays the
+/// responder role. The role is always `Responder` on the accept path; the
+/// parameter is retained for symmetry with the wire protocol.
+async fn serve_over_socket(stream: TcpStream, role: HandshakeRole, guard: SharedGuard) {
+    debug_assert_eq!(role, HandshakeRole::Responder);
     let suite = match configured_suite() {
         Ok(s) => s,
         Err(e) => {
@@ -99,21 +116,24 @@ async fn serve_over_socket(stream: TcpStream, role: HandshakeRole) {
             return;
         }
     };
-    match establish_and_bridge(stream, &identity, suite, role).await {
-        Ok(()) => eprintln!("syntriass daemon: over-socket handshake -> kTLS installed"),
+    match establish_and_bridge_gated(stream, &identity, suite, &guard).await {
+        Ok(()) => eprintln!("syntriass daemon: gated handshake -> kTLS installed"),
         Err(e) => eprintln!("syntriass daemon: over-socket session failed closed: {e}"),
     }
 }
 
-/// Over-socket responder mode: accept connections and establish kTLS on each.
+/// Over-socket responder mode: accept connections and run each through the gated
+/// handshake. A single shared `HandshakeGuard` enforces per-source + global caps.
 async fn run_over_socket_server(
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
-    eprintln!("syntriass daemon over-socket responder listening on {addr}");
+    let guard = new_shared_guard();
+    eprintln!("syntriass daemon over-socket responder (anti-DoS gate active) listening on {addr}");
     loop {
         let (stream, _) = listener.accept().await?;
-        tokio::spawn(serve_over_socket(stream, HandshakeRole::Responder));
+        let guard = Arc::clone(&guard);
+        tokio::spawn(serve_over_socket(stream, HandshakeRole::Responder, guard));
     }
 }
 
@@ -125,11 +145,13 @@ async fn run_over_socket_server(
 async fn run_fd_passing_server(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
-    eprintln!("syntriass daemon fd-passing (SCM_RIGHTS) listening on {path}");
+    let guard = new_shared_guard();
+    eprintln!("syntriass daemon fd-passing (SCM_RIGHTS, anti-DoS gate active) listening on {path}");
     loop {
         let (channel, _) = listener.accept().await?;
+        let guard = Arc::clone(&guard);
         tokio::spawn(async move {
-            if let Err(e) = handle_passed_fd(channel).await {
+            if let Err(e) = handle_passed_fd(channel, guard).await {
                 eprintln!("syntriass daemon: fd-passing channel error: {e}");
             }
         });
@@ -141,6 +163,7 @@ async fn run_fd_passing_server(path: &str) -> Result<(), Box<dyn std::error::Err
 /// (fail closed) without ever touching application bytes.
 async fn handle_passed_fd(
     channel: UnixStream,
+    guard: SharedGuard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // recvmsg is blocking; run it on a blocking thread with the UDS in blocking
     // mode, and close the control channel as soon as the fd is consumed.
@@ -163,7 +186,7 @@ async fn handle_passed_fd(
     let std_tcp = unsafe { std::net::TcpStream::from_raw_fd(fd) };
     std_tcp.set_nonblocking(true)?;
     let stream = TcpStream::from_std(std_tcp)?;
-    serve_over_socket(stream, HandshakeRole::Responder).await;
+    serve_over_socket(stream, HandshakeRole::Responder, guard).await;
     Ok(())
 }
 

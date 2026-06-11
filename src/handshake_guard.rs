@@ -91,6 +91,15 @@ pub struct GuardConfig {
     pub max_sources: usize,
     /// Maximum consumed-cookie tags retained for replay detection (bounds memory).
     pub max_replay_entries: usize,
+    /// **Global** admitted-PQC rate, summed across *all* sources (per second).
+    /// Complements the per-source bucket: caps aggregate responder work even
+    /// under a distributed (many-source) flood. 0 disables the global rate gate.
+    pub global_pqc_per_sec: u32,
+    /// Global admitted-PQC burst capacity (token-bucket depth). 0 disables.
+    pub global_pqc_burst: u32,
+    /// Maximum number of PQC handshakes allowed *in flight* at once (concurrency
+    /// cap / load-shed). 0 disables the concurrency gate.
+    pub max_in_flight_pqc: u32,
 }
 
 impl Default for GuardConfig {
@@ -102,6 +111,12 @@ impl Default for GuardConfig {
             rate_refill_per_sec: 10,
             max_sources: 4096,
             max_replay_entries: 8192,
+            // Aggregate ceiling: at most 200 admitted PQC handshakes/sec sustained
+            // (burst 400), and at most 256 in flight at once. These bound total
+            // responder work irrespective of how many distinct sources attack.
+            global_pqc_per_sec: 200,
+            global_pqc_burst: 400,
+            max_in_flight_pqc: 256,
         }
     }
 }
@@ -158,6 +173,13 @@ pub enum AdmissionError {
     Replay,
     /// Cookie failed to parse.
     Malformed,
+    /// The global admitted-PQC rate ceiling was hit (aggregate across all
+    /// sources). The caller sheds this connection; a legitimate peer simply
+    /// reconnects to obtain a fresh cookie and retry.
+    GlobalRateLimited,
+    /// The in-flight PQC concurrency cap was hit (load-shed). As with
+    /// `GlobalRateLimited`, the peer reconnects for a fresh cookie to retry.
+    AtCapacity,
 }
 
 #[derive(Clone, Copy)]
@@ -176,10 +198,16 @@ pub struct HandshakeGuard {
     buckets: HashMap<[u8; 16], Bucket>,
     /// consumed cookie tag -> issued_at (for time-based pruning).
     consumed: HashMap<[u8; TAG_LEN], u64>,
+    /// Global (all-sources) admitted-PQC rate bucket.
+    global_bucket: Bucket,
+    /// PQC handshakes currently in flight (concurrency gate).
+    in_flight: u32,
     // Lifetime counters (observability; no timing, just counts).
     issued: u64,
     admitted: u64,
     rejected: u64,
+    /// Connections shed by the global rate or concurrency gate.
+    global_shed: u64,
 }
 
 impl HandshakeGuard {
@@ -195,9 +223,15 @@ impl HandshakeGuard {
             have_prev: false,
             buckets: HashMap::new(),
             consumed: HashMap::new(),
+            global_bucket: Bucket {
+                tokens: cfg.global_pqc_burst as f64,
+                last: now,
+            },
+            in_flight: 0,
             issued: 0,
             admitted: 0,
             rejected: 0,
+            global_shed: 0,
         }
     }
 
@@ -402,6 +436,68 @@ impl HandshakeGuard {
         self.admitted += 1;
         Ok(())
     }
+
+    /// **Global gate** — reserve a slot for one PQC handshake, enforcing the
+    /// aggregate (all-sources) rate ceiling and the in-flight concurrency cap.
+    ///
+    /// Call this *after* [`admit`](Self::admit) returns `Ok` and *before* running
+    /// the expensive `respond()`. On `Ok` a concurrency slot is reserved and the
+    /// caller MUST later call [`release_pqc`](Self::release_pqc) (the over-socket
+    /// path uses an RAII permit so this happens even on error/panic). On `Err`
+    /// the caller sheds the connection without doing PQC; nothing is reserved.
+    ///
+    /// This is the control that bounds a *distributed* flood: per-source limiting
+    /// caps each attacker, but only this aggregate gate caps the responder's total
+    /// PQC work when the sources are numerous and individually under budget.
+    pub fn try_acquire_pqc(&mut self, now: u64) -> Result<(), AdmissionError> {
+        // Concurrency cap first (cheapest), then the aggregate rate.
+        if self.cfg.max_in_flight_pqc != 0 && self.in_flight >= self.cfg.max_in_flight_pqc {
+            self.global_shed += 1;
+            return Err(AdmissionError::AtCapacity);
+        }
+        if self.cfg.global_pqc_burst != 0 {
+            let cap = self.cfg.global_pqc_burst as f64;
+            let refill = self.cfg.global_pqc_per_sec as f64;
+            let elapsed = now.saturating_sub(self.global_bucket.last) as f64;
+            self.global_bucket.tokens = (self.global_bucket.tokens + elapsed * refill).min(cap);
+            self.global_bucket.last = now;
+            if self.global_bucket.tokens < 1.0 {
+                self.global_shed += 1;
+                return Err(AdmissionError::GlobalRateLimited);
+            }
+            self.global_bucket.tokens -= 1.0;
+        }
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    /// Release a slot reserved by [`try_acquire_pqc`](Self::try_acquire_pqc).
+    pub fn release_pqc(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+
+    /// PQC handshakes currently in flight.
+    pub fn in_flight_pqc(&self) -> u32 {
+        self.in_flight
+    }
+
+    /// Connections shed by the global rate or concurrency gate (lifetime).
+    pub fn pqc_shed(&self) -> u64 {
+        self.global_shed
+    }
+}
+
+/// Coarse, monotonic wall-clock seconds for the live daemon path.
+///
+/// Derived from a process-start `Instant`, so it never goes backwards (immune to
+/// system-clock adjustments) — the property the cookie freshness window needs.
+/// Tests inject explicit `now` values instead of calling this.
+pub fn monotonic_secs() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    // Offset by 1 so the very first second is non-zero (keeps `issued_at != 0`).
+    START.get_or_init(Instant::now).elapsed().as_secs() + 1
 }
 
 #[cfg(test)]
@@ -572,5 +668,89 @@ mod tests {
             "source map exceeded cap: {}",
             g.tracked_sources()
         );
+    }
+
+    #[test]
+    fn global_rate_gate_caps_aggregate_pqc_across_sources() {
+        // Per-source budget is generous, but the GLOBAL ceiling is small: even a
+        // distributed flood from many distinct sources cannot exceed it.
+        let cfg = GuardConfig {
+            rate_capacity: 1000,
+            rate_refill_per_sec: 1000,
+            global_pqc_per_sec: 10,
+            global_pqc_burst: 10,
+            max_in_flight_pqc: 0, // isolate the rate gate
+            ..GuardConfig::default()
+        };
+        let mut g = HandshakeGuard::new(cfg, 1_000);
+        let mut acquired = 0u32;
+        let mut shed = 0u32;
+        // 500 distinct sources, each with a valid cookie, all in one second.
+        for i in 0..500u32 {
+            let src = format!("src-{i}");
+            let cookie = g.request(src.as_bytes(), 1_000).unwrap();
+            g.admit(src.as_bytes(), &cookie, 1_000).unwrap();
+            match g.try_acquire_pqc(1_000) {
+                Ok(()) => {
+                    acquired += 1;
+                    g.release_pqc();
+                }
+                Err(AdmissionError::GlobalRateLimited) => shed += 1,
+                Err(e) => panic!("unexpected {e:?}"),
+            }
+        }
+        assert_eq!(acquired, 10, "global burst must cap aggregate admits");
+        assert_eq!(shed, 490);
+        assert_eq!(g.pqc_shed(), 490);
+    }
+
+    #[test]
+    fn global_rate_gate_refills_over_time() {
+        let cfg = GuardConfig {
+            global_pqc_per_sec: 5,
+            global_pqc_burst: 5,
+            max_in_flight_pqc: 0,
+            ..GuardConfig::default()
+        };
+        let mut g = HandshakeGuard::new(cfg, 1_000);
+        for _ in 0..5 {
+            assert_eq!(g.try_acquire_pqc(1_000), Ok(()));
+            g.release_pqc();
+        }
+        assert_eq!(
+            g.try_acquire_pqc(1_000),
+            Err(AdmissionError::GlobalRateLimited)
+        );
+        // One second later, 5 tokens refill.
+        assert_eq!(g.try_acquire_pqc(1_001), Ok(()));
+    }
+
+    #[test]
+    fn concurrency_gate_caps_in_flight_pqc() {
+        let cfg = GuardConfig {
+            max_in_flight_pqc: 4,
+            global_pqc_burst: 0, // isolate the concurrency gate
+            ..GuardConfig::default()
+        };
+        let mut g = HandshakeGuard::new(cfg, 1_000);
+        // Reserve up to the cap without releasing.
+        for _ in 0..4 {
+            assert_eq!(g.try_acquire_pqc(1_000), Ok(()));
+        }
+        assert_eq!(g.in_flight_pqc(), 4);
+        assert_eq!(g.try_acquire_pqc(1_000), Err(AdmissionError::AtCapacity));
+        // Releasing one frees exactly one slot.
+        g.release_pqc();
+        assert_eq!(g.in_flight_pqc(), 3);
+        assert_eq!(g.try_acquire_pqc(1_000), Ok(()));
+        assert_eq!(g.in_flight_pqc(), 4);
+    }
+
+    #[test]
+    fn release_pqc_is_saturating() {
+        let mut g = guard();
+        // Releasing with nothing in flight must not underflow.
+        g.release_pqc();
+        assert_eq!(g.in_flight_pqc(), 0);
     }
 }

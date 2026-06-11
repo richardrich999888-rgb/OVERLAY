@@ -82,6 +82,22 @@ impl Responder {
             self.run_real_pqc();
         }
     }
+
+    /// A full honest attempt that *also* passes through the global gate (aggregate
+    /// PQC-rate + concurrency), exactly as the live daemon path does. PQC runs and
+    /// the concurrency slot is released only on full success.
+    fn honest_attempt_globally_gated(
+        &mut self,
+        source: &[u8],
+        now: u64,
+    ) -> Result<(), AdmissionError> {
+        let cookie = self.guard.request(source, now)?;
+        self.guard.admit(source, &cookie, now)?;
+        self.guard.try_acquire_pqc(now)?;
+        self.run_real_pqc();
+        self.guard.release_pqc();
+        Ok(())
+    }
 }
 
 #[test]
@@ -272,5 +288,46 @@ fn mixed_flood_resource_bounds_hold() {
         r.pqc_invocations,
         r.guard.tracked_sources(),
         r.guard.replay_entries()
+    );
+}
+
+#[test]
+fn distributed_source_flood_is_bounded_by_global_gate() {
+    // The hardest case for per-source limiting: a *distributed* flood where every
+    // source stays within its own budget, so per-source rate limiting never fires.
+    // Only the GLOBAL aggregate gate caps the responder's total PQC work.
+    let cfg = GuardConfig {
+        rate_capacity: 1_000, // per-source limit cannot mask the effect
+        rate_refill_per_sec: 1_000,
+        global_pqc_per_sec: 25, // aggregate ceiling
+        global_pqc_burst: 25,
+        max_in_flight_pqc: 0, // isolate the global rate gate
+        max_sources: 100_000,
+        ..GuardConfig::default()
+    };
+    let mut r = Responder::new(cfg, 1_000);
+
+    let sources = 5_000u32;
+    let mut admitted_pqc = 0u64;
+    let mut global_shed = 0u64;
+    for i in 0..sources {
+        // Each connection is from a *distinct* source IP, one attempt each.
+        let src = format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256);
+        match r.honest_attempt_globally_gated(src.as_bytes(), 1_000) {
+            Ok(()) => admitted_pqc += 1,
+            Err(AdmissionError::GlobalRateLimited) => global_shed += 1,
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+    }
+
+    // Real PQC ran exactly the global burst, no matter how many distinct sources
+    // attacked. The remainder were shed cheaply with zero PQC.
+    assert_eq!(r.pqc_invocations, 25);
+    assert_eq!(admitted_pqc, 25);
+    assert_eq!(global_shed, (sources as u64) - 25);
+    assert_eq!(r.guard.pqc_shed(), global_shed);
+    eprintln!(
+        "[distributed ] distinct_sources={sources} admitted_pqc={admitted_pqc} \
+         global_shed={global_shed} (global burst=25)"
     );
 }
