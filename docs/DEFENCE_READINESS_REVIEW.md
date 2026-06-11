@@ -28,7 +28,7 @@ yet backed by committed evidence.
 | **C6** | Handshake-flood CPU exhaustion: PQC work performed before peer validation | High → **Low** | **Mitigated — gate on the real daemon path; per-source + global caps; validated in-process, on the wire, and against the spawned daemon** | `docs/HANDSHAKE_DOS_HARDENING.md`; `src/handshake_guard.rs`; `src/bin/daemon.rs`; `src/over_socket.rs`; `tests/handshake_dos_tests.rs`, `tests/handshake_dos_integration.rs`, `tests/chaos_orchestration.rs` |
 | (PQC-2) | Long-session key-wear, no anti-replay/rekey on lossy links | Med | **Mitigated (record layer implemented + tested)** | `docs/PQC_PROTOCOL_SPEC.md §4`; `src/crypto/session.rs`; `tests/session_hardening_tests.rs` |
 | **FC-1** | Fail-closed assurance gap: no automated proof of no-cleartext / no-panic / concurrency safety; 85/86 `unsafe` blocks undocumented; a misaligned-reference UB in the config watcher | High → **Low** | **Mitigated + validated here: property + leakage + concurrency proof, panic-path & unsafe audit (1 UB bug fixed), and Miri + Loom + cargo-fuzz all run on a nightly toolchain** | `docs/FAIL_CLOSED_ASSURANCE.md`; `tests/fail_closed_properties.rs`, `tests/concurrency_stress.rs`, `tests/leakage_analysis.rs`, `tests/loom_model.rs`; `scripts/run_miri.sh`, `fuzz/`; `src/lib.rs` (`#![deny(unused_must_use)]`) |
-| **IL-1** | No identity lifecycle: peer keys statically pinned, never enrolled/rotated/revoked/expired | High → **Low–Medium** | **Mitigated: hybrid-PQC credential system (enrollment+PoP, issuance, rotation, revocation, expiry, offline) implemented + tested, and shown driving the real handshake; TPM2/PKCS#11/HSM evaluated as design with infra plan** | `docs/IDENTITY_LIFECYCLE.md`; `src/identity.rs`; `tests/identity_lifecycle_tests.rs` |
+| **IL-1** | No identity lifecycle: peer keys statically pinned, never enrolled/rotated/revoked/expired | High → **Low** | **Mitigated: hybrid-PQC credential lifecycle — enrollment+PoP, issuance, scheduled & emergency rotation, renewal, CRL revocation with monotonic propagation, expiry, lost-key/compromised-node recovery, and offline/air-gap provisioning — 28 tests + benchmarks, shown driving the real handshake; TPM2/PKCS#11/HSM evaluated as design with infra plan** | `docs/IDENTITY_LIFECYCLE.md`, `docs/OFFLINE_PROVISIONING.md`; `src/identity.rs`; `tests/identity_lifecycle_tests.rs`; `benches/identity_benchmarks.rs` |
 | **C1** | LD_PRELOAD interception is incomplete (static/Go/musl/direct-syscall bypass it) | High → **Low** | **Replaced with a kernel `cgroup/connect4` eBPF data plane, built+loaded+attached+measured: 7/7 runtimes intercepted incl. the 4 LD_PRELOAD blind spots; fail-closed deny enforced (EPERM)** | `docs/UNIVERSAL_INTERCEPTION.md`; `ebpf/c/`, `ebpf/COVERAGE_REPORT.txt`; `scripts/ebpf_coverage_validate.sh` |
 | C2–C5, C7 | Resilience (`tc netem`), sovereign/ARM, et al. | — | **Open / tracked** | host-only / future increments (see §4) |
 
@@ -215,13 +215,16 @@ lane* to run Miri/Loom/fuzz per-PR (R2), not an unaddressed code weakness.
    no-cleartext / no-panic / cap-never-exceeded invariants, unsafe-code audit, and
    `#![deny(unused_must_use)]` lint hardening; Miri + Loom + cargo-fuzz run on a
    nightly toolchain (2 real bugs found + fixed). This document, §2A.
-4. **Identity lifecycle (IL-1).** Hybrid-PQC credential system — enrollment with
-   proof-of-possession, issuance, rotation (overlapping validity), CRL revocation,
-   expiry, and offline/air-gap provisioning — implemented, tested, and shown
-   producing the peer keys that drive the real handshake. TPM2/PKCS#11/HSM
-   evaluated behind a `HybridSigner` trait with an infra-gated validation plan and
-   the honest PQC caveat (hardware protects the classical key; ML-DSA stays
-   software-side until PQC-capable HSMs ship). `docs/IDENTITY_LIFECYCLE.md`.
+4. **Identity lifecycle (IL-1).** Hybrid-PQC credential lifecycle — enrollment with
+   proof-of-possession, issuance, **scheduled (zero-downtime) and emergency
+   rotation**, **renewal**, **CRL revocation with monotonic rollback-proof
+   propagation**, expiry, **lost-key/compromised-node recovery (epoch-floor
+   supersession)**, and offline/air-gap provisioning — 21 unit + 7 integration
+   tests + benchmarks, shown producing the peer keys that drive the real handshake.
+   TPM2/PKCS#11/HSM evaluated behind a `HybridSigner` trait with an infra-gated
+   validation plan and the honest PQC caveat (hardware protects the classical key;
+   ML-DSA stays software-side until PQC-capable HSMs ship).
+   `docs/IDENTITY_LIFECYCLE.md`, `docs/OFFLINE_PROVISIONING.md`.
 
 5. **Universal interception (C1).** A kernel `cgroup/connect4` eBPF data plane
    replacing LD_PRELOAD — built, loaded, attached, and **measured** on a BPF-capable

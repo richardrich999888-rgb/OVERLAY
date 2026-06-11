@@ -61,6 +61,7 @@ use crate::crypto::{
 const CRED_DOMAIN: &[u8] = b"syntriass-overlay identity-credential v1";
 const REQ_DOMAIN: &[u8] = b"syntriass-overlay enrollment-request v1";
 const CRL_DOMAIN: &[u8] = b"syntriass-overlay revocation-list v1";
+const REC_DOMAIN: &[u8] = b"syntriass-overlay recovery-authorization v1";
 
 /// Node identifier (opaque 16 bytes; e.g. a UUID or a hashed hostname).
 pub type NodeId = [u8; 16];
@@ -80,6 +81,13 @@ pub enum IdentityError {
     Revoked,
     /// The revocation list is past its `next_update` (stale).
     StaleRevocationList,
+    /// A CRL older than one already installed was offered (rollback attempt).
+    CrlRollback,
+    /// The credential's epoch is below the node's recovery/rotation floor — it
+    /// has been superseded by a newer identity for the same node.
+    Superseded,
+    /// A recovery authorization did not verify under the CA's keys.
+    BadRecoveryAuthorization,
     /// A field had the wrong length or the blob was truncated/corrupt.
     Malformed,
     /// Key material could not be loaded (bad seed).
@@ -477,21 +485,50 @@ impl<S: HybridSigner> IssuingAuthority<S> {
     }
 
     /// Issue a signed revocation list covering `serials`, valid until `next_update`.
+    /// Issue a signed revocation list. `crl_number` is a strictly monotonic
+    /// counter the CA increments for every CRL it publishes; relying parties
+    /// reject any CRL whose number is not greater than the last they installed,
+    /// which defeats a rollback that would silently "un-revoke" a compromised
+    /// serial (revocation propagation, §revocation in the docs).
     pub fn revoke(
         &self,
         serials: &[u64],
+        crl_number: u64,
         issued_at: u64,
         next_update: u64,
     ) -> Result<RevocationList, IdentityError> {
         let mut sorted = serials.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        let body = revocation_body(issued_at, next_update, &sorted);
+        let body = revocation_body(crl_number, issued_at, next_update, &sorted);
         let (ed_sig, mldsa_sig) = self.signer.sign_hybrid(&body)?;
         Ok(RevocationList {
+            crl_number,
             issued_at,
             next_update,
             serials: sorted,
+            ca_ed_sig: ed_sig,
+            ca_mldsa_sig: mldsa_sig,
+        })
+    }
+
+    /// Authorize recovery / emergency rotation of `node_id`: a CA-signed
+    /// statement that all credentials for this node with epoch < `epoch_floor`
+    /// are superseded. A relying party that installs this rejects the old
+    /// (lost/compromised) identity immediately — without waiting for its expiry
+    /// and without needing every old serial enumerated on a CRL.
+    pub fn authorize_recovery(
+        &self,
+        node_id: NodeId,
+        epoch_floor: u32,
+        issued_at: u64,
+    ) -> Result<RecoveryAuthorization, IdentityError> {
+        let body = recovery_body(&node_id, epoch_floor, issued_at);
+        let (ed_sig, mldsa_sig) = self.signer.sign_hybrid(&body)?;
+        Ok(RecoveryAuthorization {
+            node_id,
+            epoch_floor,
+            issued_at,
             ca_ed_sig: ed_sig,
             ca_mldsa_sig: mldsa_sig,
         })
@@ -507,9 +544,10 @@ pub struct AuthorityPublic {
 
 // ------------------------------- revocation list ----------------------------------
 
-fn revocation_body(issued_at: u64, next_update: u64, serials: &[u64]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(CRL_DOMAIN.len() + 20 + serials.len() * 8);
+fn revocation_body(crl_number: u64, issued_at: u64, next_update: u64, serials: &[u64]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(CRL_DOMAIN.len() + 28 + serials.len() * 8);
     m.extend_from_slice(CRL_DOMAIN);
+    put_u64(&mut m, crl_number);
     put_u64(&mut m, issued_at);
     put_u64(&mut m, next_update);
     put_u32(&mut m, serials.len() as u32);
@@ -519,8 +557,10 @@ fn revocation_body(issued_at: u64, next_update: u64, serials: &[u64]) -> Vec<u8>
     m
 }
 
-/// A CA-signed, freshness-bounded list of revoked credential serials.
+/// A CA-signed, freshness-bounded, monotonically-numbered list of revoked
+/// credential serials.
 pub struct RevocationList {
+    pub crl_number: u64,
     pub issued_at: u64,
     pub next_update: u64,
     serials: Vec<u64>,
@@ -531,6 +571,7 @@ pub struct RevocationList {
 impl RevocationList {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        put_u64(&mut out, self.crl_number);
         put_u64(&mut out, self.issued_at);
         put_u64(&mut out, self.next_update);
         put_u32(&mut out, self.serials.len() as u32);
@@ -543,6 +584,7 @@ impl RevocationList {
     }
     pub fn from_bytes(b: &[u8]) -> Result<Self, IdentityError> {
         let mut r = Reader::new(b);
+        let crl_number = r.u64()?;
         let issued_at = r.u64()?;
         let next_update = r.u64()?;
         let count = r.u32()? as usize;
@@ -555,6 +597,7 @@ impl RevocationList {
         let ca_mldsa_sig = r.var()?.to_vec();
         r.finish()?;
         Ok(Self {
+            crl_number,
             issued_at,
             next_update,
             serials,
@@ -563,7 +606,12 @@ impl RevocationList {
         })
     }
     fn verify(&self, ca: &AuthorityPublic, now: u64) -> Result<(), IdentityError> {
-        let body = revocation_body(self.issued_at, self.next_update, &self.serials);
+        let body = revocation_body(
+            self.crl_number,
+            self.issued_at,
+            self.next_update,
+            &self.serials,
+        );
         ed_verify(&ca.ed25519_pub, &body, &self.ca_ed_sig)?;
         mldsa_verify(&ca.mldsa65_pub, &body, &self.ca_mldsa_sig)?;
         if now >= self.next_update {
@@ -576,23 +624,137 @@ impl RevocationList {
     }
 }
 
+// ----------------------------- recovery authorization -----------------------------
+
+fn recovery_body(node_id: &NodeId, epoch_floor: u32, issued_at: u64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(REC_DOMAIN.len() + 16 + 4 + 8);
+    m.extend_from_slice(REC_DOMAIN);
+    m.extend_from_slice(node_id);
+    put_u32(&mut m, epoch_floor);
+    put_u64(&mut m, issued_at);
+    m
+}
+
+/// A CA-signed grant that recovers / emergency-rotates a node: it raises the
+/// trust *epoch floor* for `node_id`, immediately superseding every credential
+/// for that node with a lower epoch. This is the artifact that makes
+/// lost-key recovery and compromised-node response safe and offline-distributable
+/// (it does not depend on the old credential's expiry or on enumerating its
+/// serial, and it is unforgeable without the CA key).
+pub struct RecoveryAuthorization {
+    pub node_id: NodeId,
+    pub epoch_floor: u32,
+    pub issued_at: u64,
+    ca_ed_sig: [u8; ED25519_SIGNATURE_LEN],
+    ca_mldsa_sig: Vec<u8>,
+}
+
+impl RecoveryAuthorization {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.node_id);
+        put_u32(&mut out, self.epoch_floor);
+        put_u64(&mut out, self.issued_at);
+        out.extend_from_slice(&self.ca_ed_sig);
+        put_var(&mut out, &self.ca_mldsa_sig);
+        out
+    }
+    pub fn from_bytes(b: &[u8]) -> Result<Self, IdentityError> {
+        let mut r = Reader::new(b);
+        let node_id: NodeId = r.take(16)?.try_into().unwrap();
+        let epoch_floor = r.u32()?;
+        let issued_at = r.u64()?;
+        let ca_ed_sig: [u8; ED25519_SIGNATURE_LEN] =
+            r.take(ED25519_SIGNATURE_LEN)?.try_into().unwrap();
+        let ca_mldsa_sig = r.var()?.to_vec();
+        r.finish()?;
+        Ok(Self {
+            node_id,
+            epoch_floor,
+            issued_at,
+            ca_ed_sig,
+            ca_mldsa_sig,
+        })
+    }
+    fn verify(&self, ca: &AuthorityPublic) -> Result<(), IdentityError> {
+        let body = recovery_body(&self.node_id, self.epoch_floor, self.issued_at);
+        ed_verify(&ca.ed25519_pub, &body, &self.ca_ed_sig)
+            .map_err(|_| IdentityError::BadRecoveryAuthorization)?;
+        mldsa_verify(&ca.mldsa65_pub, &body, &self.ca_mldsa_sig)
+            .map_err(|_| IdentityError::BadRecoveryAuthorization)
+    }
+}
+
 // -------------------------------- relying-party trust -----------------------------
 
-/// What a relying peer is provisioned with (offline): the CA public keys and,
-/// optionally, the current revocation list.
+/// What a relying peer is provisioned with (offline): the CA public keys, the
+/// most recently installed revocation list, and per-node recovery floors. The
+/// store is stateful so it can enforce **revocation propagation** (monotonic CRL
+/// numbers — no rollback) and **recovery/emergency rotation** (epoch floors).
 pub struct TrustStore {
     ca: AuthorityPublic,
+    installed_crl: Option<RevocationList>,
+    last_crl_number: u64,
+    floors: std::collections::HashMap<NodeId, u32>,
 }
 
 impl TrustStore {
     pub fn new(ca: AuthorityPublic) -> Self {
-        Self { ca }
+        Self {
+            ca,
+            installed_crl: None,
+            last_crl_number: 0,
+            floors: std::collections::HashMap::new(),
+        }
     }
 
-    /// Verify a credential at time `now`, optionally against a revocation list.
-    /// Order is cheapest-meaningful-first: CA signature, then validity window,
-    /// then revocation. Any failure is fail-closed (`Err`).
+    /// Install a newer CRL. Verifies the CA signature + freshness, then enforces
+    /// **monotonicity**: a CRL whose number is not strictly greater than the last
+    /// installed is rejected as a rollback (an attacker must not be able to
+    /// replace a CRL that revokes a compromised serial with an older one that
+    /// does not). Offline-distributable: this is just signed bytes.
+    pub fn install_crl(&mut self, crl: RevocationList, now: u64) -> Result<(), IdentityError> {
+        crl.verify(&self.ca, now)?;
+        if self.installed_crl.is_some() && crl.crl_number <= self.last_crl_number {
+            return Err(IdentityError::CrlRollback);
+        }
+        self.last_crl_number = crl.crl_number;
+        self.installed_crl = Some(crl);
+        Ok(())
+    }
+
+    /// Install a CA recovery authorization, raising the trust epoch floor for the
+    /// named node (lost-key recovery / compromised-node / emergency rotation).
+    /// Idempotent and monotonic: the floor only ever rises.
+    pub fn install_recovery(&mut self, authz: &RecoveryAuthorization) -> Result<(), IdentityError> {
+        authz.verify(&self.ca)?;
+        let slot = self.floors.entry(authz.node_id).or_insert(0);
+        if authz.epoch_floor > *slot {
+            *slot = authz.epoch_floor;
+        }
+        Ok(())
+    }
+
+    /// Current epoch floor for a node (0 if none installed).
+    pub fn epoch_floor(&self, node_id: &NodeId) -> u32 {
+        self.floors.get(node_id).copied().unwrap_or(0)
+    }
+
+    /// Verify a credential at time `now` against installed state (CRL + floors).
+    /// Equivalent to `verify_with(cred, now, None)`.
     pub fn verify(
+        &self,
+        cred: &IdentityCredential,
+        now: u64,
+    ) -> Result<VerifiedIdentity, IdentityError> {
+        self.verify_with(cred, now, None)
+    }
+
+    /// Verify a credential, optionally against an explicitly supplied CRL (which
+    /// takes precedence over any installed one). Order is cheapest-meaningful
+    /// first: CA signature, validity window, recovery floor, then revocation.
+    /// Any failure is fail-closed (`Err`).
+    pub fn verify_with(
         &self,
         cred: &IdentityCredential,
         now: u64,
@@ -616,9 +778,23 @@ impl TrustStore {
             return Err(IdentityError::Expired);
         }
 
-        // 3. Revocation (if a CRL is supplied, it must be valid + fresh).
+        // 3. Recovery floor: a credential below the node's floor is superseded.
+        if cred.body.epoch < self.epoch_floor(&cred.body.node_id) {
+            return Err(IdentityError::Superseded);
+        }
+
+        // 4. Revocation. An explicitly supplied CRL must verify + be fresh now;
+        //    the installed CRL was signature-checked at install, so we only
+        //    re-enforce freshness + membership here.
         if let Some(crl) = crl {
             crl.verify(&self.ca, now)?;
+            if crl.contains(cred.body.serial) {
+                return Err(IdentityError::Revoked);
+            }
+        } else if let Some(crl) = self.installed_crl.as_ref() {
+            if now >= crl.next_update {
+                return Err(IdentityError::StaleRevocationList);
+            }
             if crl.contains(cred.body.serial) {
                 return Err(IdentityError::Revoked);
             }
@@ -674,7 +850,7 @@ mod tests {
         let (_s, req) = enroll(1);
         let cred = ca.issue(&req, 1, 0, 1_000, 2_000).unwrap();
         let store = TrustStore::new(ca.public());
-        let v = store.verify(&cred, 1_500, None).unwrap();
+        let v = store.verify(&cred, 1_500).unwrap();
         assert_eq!(v.ed25519_pub, req.ed25519_pub);
         assert_eq!(v.node_id, [1u8; 16]);
     }
@@ -685,15 +861,9 @@ mod tests {
         let (_s, req) = enroll(1);
         let cred = ca.issue(&req, 1, 0, 1_000, 2_000).unwrap();
         let store = TrustStore::new(ca.public());
-        assert_eq!(
-            store.verify(&cred, 999, None),
-            Err(IdentityError::NotYetValid)
-        );
-        assert_eq!(
-            store.verify(&cred, 2_000, None),
-            Err(IdentityError::Expired)
-        );
-        assert!(store.verify(&cred, 1_999, None).is_ok());
+        assert_eq!(store.verify(&cred, 999), Err(IdentityError::NotYetValid));
+        assert_eq!(store.verify(&cred, 2_000), Err(IdentityError::Expired));
+        assert!(store.verify(&cred, 1_999).is_ok());
     }
 
     #[test]
@@ -707,7 +877,7 @@ mod tests {
         let tampered = IdentityCredential::from_bytes(&bytes).unwrap();
         let store = TrustStore::new(ca.public());
         assert_eq!(
-            store.verify(&tampered, 1_500, None),
+            store.verify(&tampered, 1_500),
             Err(IdentityError::BadSignature)
         );
     }
@@ -719,10 +889,7 @@ mod tests {
         let cred = ca.issue(&req, 1, 0, 1_000, 2_000).unwrap();
         let other_ca = IssuingAuthority::new(SoftwareSigner::generate());
         let store = TrustStore::new(other_ca.public());
-        assert_eq!(
-            store.verify(&cred, 1_500, None),
-            Err(IdentityError::BadSignature)
-        );
+        assert_eq!(store.verify(&cred, 1_500), Err(IdentityError::BadSignature));
     }
 
     #[test]
@@ -738,11 +905,11 @@ mod tests {
         let c2 = ca.issue(&req2, 2, 1, 1_500, 3_000).unwrap();
         let store = TrustStore::new(ca.public());
         // During overlap both verify.
-        assert!(store.verify(&c1, 1_600, None).is_ok());
-        assert!(store.verify(&c2, 1_600, None).is_ok());
+        assert!(store.verify(&c1, 1_600).is_ok());
+        assert!(store.verify(&c2, 1_600).is_ok());
         // After old expiry only the rotated credential verifies.
-        assert_eq!(store.verify(&c1, 2_500, None), Err(IdentityError::Expired));
-        assert!(store.verify(&c2, 2_500, None).is_ok());
+        assert_eq!(store.verify(&c1, 2_500), Err(IdentityError::Expired));
+        assert!(store.verify(&c2, 2_500).is_ok());
     }
 
     #[test]
@@ -752,17 +919,17 @@ mod tests {
         let cred = ca.issue(&req, 42, 0, 1_000, 9_000).unwrap();
         let store = TrustStore::new(ca.public());
         // Before revocation: valid.
-        assert!(store.verify(&cred, 1_500, None).is_ok());
+        assert!(store.verify(&cred, 1_500).is_ok());
         // CA revokes serial 42 with a CRL fresh until 5000.
-        let crl = ca.revoke(&[42], 1_400, 5_000).unwrap();
+        let crl = ca.revoke(&[42], 1, 1_400, 5_000).unwrap();
         assert_eq!(
-            store.verify(&cred, 1_500, Some(&crl)),
+            store.verify_with(&cred, 1_500, Some(&crl)),
             Err(IdentityError::Revoked)
         );
         // A different serial on the same CRL is unaffected.
         let (_s2, req2) = enroll(2);
         let cred2 = ca.issue(&req2, 43, 0, 1_000, 9_000).unwrap();
-        assert!(store.verify(&cred2, 1_500, Some(&crl)).is_ok());
+        assert!(store.verify_with(&cred2, 1_500, Some(&crl)).is_ok());
     }
 
     #[test]
@@ -771,10 +938,10 @@ mod tests {
         let (_s, req) = enroll(1);
         let cred = ca.issue(&req, 1, 0, 1_000, 9_000).unwrap();
         let store = TrustStore::new(ca.public());
-        let crl = ca.revoke(&[999], 1_400, 2_000).unwrap();
+        let crl = ca.revoke(&[999], 1, 1_400, 2_000).unwrap();
         // Past next_update -> the CRL is stale, so we cannot trust "not revoked".
         assert_eq!(
-            store.verify(&cred, 2_001, Some(&crl)),
+            store.verify_with(&cred, 2_001, Some(&crl)),
             Err(IdentityError::StaleRevocationList)
         );
     }
@@ -786,10 +953,10 @@ mod tests {
         let cred = ca.issue(&req, 7, 0, 1_000, 9_000).unwrap();
         // CRL signed by a DIFFERENT authority must not be honoured.
         let evil = IssuingAuthority::new(SoftwareSigner::generate());
-        let crl = evil.revoke(&[7], 1_400, 5_000).unwrap();
+        let crl = evil.revoke(&[7], 1, 1_400, 5_000).unwrap();
         let store = TrustStore::new(ca.public());
         assert_eq!(
-            store.verify(&cred, 1_500, Some(&crl)),
+            store.verify_with(&cred, 1_500, Some(&crl)),
             Err(IdentityError::BadSignature)
         );
     }
@@ -802,14 +969,14 @@ mod tests {
         let ca_pub = ca.public();
         let (_s, req) = enroll(1);
         let cred_bytes = ca.issue(&req, 100, 0, 1_000, 9_000).unwrap().to_bytes();
-        let crl_bytes = ca.revoke(&[200], 1_000, 9_000).unwrap().to_bytes();
+        let crl_bytes = ca.revoke(&[200], 1, 1_000, 9_000).unwrap().to_bytes();
 
         // ... transported across the gap as opaque bytes ...
 
         let store = TrustStore::new(ca_pub);
         let cred = IdentityCredential::from_bytes(&cred_bytes).unwrap();
         let crl = RevocationList::from_bytes(&crl_bytes).unwrap();
-        assert!(store.verify(&cred, 1_500, Some(&crl)).is_ok());
+        assert!(store.verify_with(&cred, 1_500, Some(&crl)).is_ok());
     }
 
     #[test]
@@ -822,5 +989,174 @@ mod tests {
             let _ = IdentityCredential::from_bytes(&full[..len]);
         }
         assert!(IdentityCredential::from_bytes(&full).is_ok());
+        // Recovery authorizations and CRLs also never panic on truncation.
+        let authz = ca
+            .authorize_recovery([1u8; 16], 1, 1_000)
+            .unwrap()
+            .to_bytes();
+        for len in 0..authz.len() {
+            let _ = RecoveryAuthorization::from_bytes(&authz[..len]);
+        }
+        let crl = ca.revoke(&[1, 2], 1, 1_000, 9_000).unwrap().to_bytes();
+        for len in 0..crl.len() {
+            let _ = RevocationList::from_bytes(&crl[..len]);
+        }
+    }
+
+    // ---------------------------- recovery / emergency rotation ----------------------------
+
+    #[test]
+    fn recovery_supersedes_lower_epoch_and_admits_new() {
+        // Lost-key recovery: node had epoch-0 credential; it lost the key. The CA
+        // authorizes recovery (floor = 1) and issues a fresh epoch-1 credential
+        // with NEW keys. A peer that installs the authorization rejects the old
+        // identity (Superseded) and accepts the new one — without the old serial
+        // ever appearing on a CRL and without waiting for its expiry.
+        let ca = authority();
+        let (_old, old_req) = enroll(0x33);
+        let old = ca.issue(&old_req, 100, 0, 1_000, 9_000).unwrap();
+
+        let new_signer = SoftwareSigner::generate();
+        let new_req = EnrollmentRequest::create([0x33; 16], &new_signer).unwrap();
+        let new = ca.issue(&new_req, 101, 1, 1_000, 9_000).unwrap();
+
+        let mut store = TrustStore::new(ca.public());
+        // Before recovery: both verify (overlapping validity).
+        assert!(store.verify(&old, 1_500).is_ok());
+        assert!(store.verify(&new, 1_500).is_ok());
+
+        let authz = ca.authorize_recovery([0x33; 16], 1, 1_400).unwrap();
+        store.install_recovery(&authz).unwrap();
+
+        assert_eq!(store.verify(&old, 1_500), Err(IdentityError::Superseded));
+        assert!(store.verify(&new, 1_500).is_ok());
+        assert_eq!(store.epoch_floor(&[0x33; 16]), 1);
+    }
+
+    #[test]
+    fn recovery_floor_is_node_scoped() {
+        // Recovering node A must not affect node B's identity.
+        let ca = authority();
+        let (_sa, ra) = enroll(0xAA);
+        let (_sb, rb) = enroll(0xBB);
+        let ca_cred = ca.issue(&ra, 1, 0, 1_000, 9_000).unwrap();
+        let cb_cred = ca.issue(&rb, 2, 0, 1_000, 9_000).unwrap();
+        let mut store = TrustStore::new(ca.public());
+        store
+            .install_recovery(&ca.authorize_recovery([0xAA; 16], 1, 1_000).unwrap())
+            .unwrap();
+        assert_eq!(
+            store.verify(&ca_cred, 1_500),
+            Err(IdentityError::Superseded)
+        );
+        assert!(store.verify(&cb_cred, 1_500).is_ok()); // B unaffected
+    }
+
+    #[test]
+    fn forged_recovery_authorization_is_rejected() {
+        let ca = authority();
+        let evil = IssuingAuthority::new(SoftwareSigner::generate());
+        let mut store = TrustStore::new(ca.public());
+        let bad = evil.authorize_recovery([0x33; 16], 5, 1_000).unwrap();
+        assert_eq!(
+            store.install_recovery(&bad),
+            Err(IdentityError::BadRecoveryAuthorization)
+        );
+        assert_eq!(store.epoch_floor(&[0x33; 16]), 0); // floor unchanged
+    }
+
+    #[test]
+    fn compromised_node_workflow_revoke_and_supersede() {
+        // Compromise response: the attacker holds the node's key, so the cred is
+        // cryptographically valid. The CA (a) revokes the serial and (b) raises
+        // the epoch floor. EITHER control blocks the compromised credential.
+        let ca = authority();
+        let (_s, req) = enroll(0x44);
+        let compromised = ca.issue(&req, 500, 0, 1_000, 9_000).unwrap();
+        let mut store = TrustStore::new(ca.public());
+        assert!(store.verify(&compromised, 1_500).is_ok());
+
+        // Emergency CRL (number 7) revokes serial 500.
+        store
+            .install_crl(ca.revoke(&[500], 7, 1_400, 9_000).unwrap(), 1_500)
+            .unwrap();
+        assert_eq!(
+            store.verify(&compromised, 1_500),
+            Err(IdentityError::Revoked)
+        );
+
+        // And the recovery authorization supersedes the whole epoch.
+        store
+            .install_recovery(&ca.authorize_recovery([0x44; 16], 1, 1_400).unwrap())
+            .unwrap();
+        // Still rejected (now by the floor too).
+        assert!(store.verify(&compromised, 1_500).is_err());
+    }
+
+    // ---------------------------- revocation propagation ----------------------------
+
+    #[test]
+    fn crl_rollback_is_rejected() {
+        // An attacker must not replace a CRL that revokes serial 9 with an older
+        // CRL (lower number) that omits it.
+        let ca = authority();
+        let (_s, req) = enroll(0x55);
+        let cred = ca.issue(&req, 9, 0, 1_000, 9_000).unwrap();
+        let mut store = TrustStore::new(ca.public());
+
+        let crl_v3 = ca.revoke(&[9], 3, 1_000, 9_000).unwrap(); // revokes 9
+        let crl_v2 = ca.revoke(&[], 2, 1_000, 9_000).unwrap(); // older, empty
+        store.install_crl(crl_v3, 1_500).unwrap();
+        assert_eq!(store.verify(&cred, 1_500), Err(IdentityError::Revoked));
+        // Replaying the older CRL is rejected as a rollback; revocation persists.
+        assert_eq!(
+            store.install_crl(crl_v2, 1_500),
+            Err(IdentityError::CrlRollback)
+        );
+        assert_eq!(store.verify(&cred, 1_500), Err(IdentityError::Revoked));
+        // A newer CRL (number 4) that no longer lists 9 is honoured (un-revoked).
+        store
+            .install_crl(ca.revoke(&[], 4, 1_000, 9_000).unwrap(), 1_500)
+            .unwrap();
+        assert!(store.verify(&cred, 1_500).is_ok());
+    }
+
+    #[test]
+    fn installed_stale_crl_is_rejected_at_verify_time() {
+        let ca = authority();
+        let (_s, req) = enroll(0x66);
+        let cred = ca.issue(&req, 1, 0, 1_000, 9_000).unwrap();
+        let mut store = TrustStore::new(ca.public());
+        store
+            .install_crl(ca.revoke(&[999], 1, 1_000, 2_000).unwrap(), 1_500)
+            .unwrap();
+        // Past the CRL's next_update: we can no longer trust "not revoked".
+        assert_eq!(
+            store.verify(&cred, 2_001),
+            Err(IdentityError::StaleRevocationList)
+        );
+    }
+
+    // ---------------------------- renewal (same key, extended) ----------------------------
+
+    #[test]
+    fn renewal_extends_validity_with_continuity() {
+        // Renewal (distinct from rotation): the SAME key is re-certified with a
+        // later window before expiry, so the identity is continuous.
+        let ca = authority();
+        let (signer, req) = enroll(0x77);
+        let c1 = ca.issue(&req, 1, 0, 1_000, 2_000).unwrap();
+        // Before expiry the node re-requests with the same signer (same key).
+        let req2 = EnrollmentRequest::create([0x77; 16], &signer).unwrap();
+        let c2 = ca.issue(&req2, 2, 0, 1_800, 3_000).unwrap();
+        let store = TrustStore::new(ca.public());
+        // Same public key in both (continuity of identity).
+        let v1 = store.verify(&c1, 1_900).unwrap();
+        let v2 = store.verify(&c2, 1_900).unwrap();
+        assert_eq!(v1.ed25519_pub, v2.ed25519_pub);
+        assert_eq!(v1.mldsa65_pub, v2.mldsa65_pub);
+        // Overlap window: both valid; after old expiry only the renewal.
+        assert!(store.verify(&c1, 2_500).is_err());
+        assert!(store.verify(&c2, 2_500).is_ok());
     }
 }

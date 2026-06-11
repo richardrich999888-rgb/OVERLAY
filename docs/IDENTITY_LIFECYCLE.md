@@ -31,6 +31,13 @@ only the authority's public keys.
 | **Revocation** | `IssuingAuthority.revoke()` produces a CA-signed `RevocationList` (serials + `next_update` freshness bound). `TrustStore.verify` rejects a credential whose serial is on a valid, fresh CRL. | **[implemented]** |
 | **Expiry** | Every credential carries `not_before`/`not_after`; verification fails closed (`NotYetValid` / `Expired`) outside the window. | **[implemented]** |
 | **Offline provisioning (air-gap)** | Requests, credentials, and CRLs are opaque signed bytes (`to_bytes`/`from_bytes`). The authority can run fully disconnected; a relying peer needs only the CA public keys (provisioned out-of-band) to verify. No network, no shared state. | **[implemented]** |
+| **Renewal** | Re-certify the **same key** with a later window before expiry (continuity of identity), distinct from rotation (new key). | **[implemented]/[tested]** |
+| **Recovery** (lost-key / compromised-node) | CA-signed `RecoveryAuthorization` raises a per-node **epoch floor**, immediately superseding all lower-epoch credentials — without waiting for expiry or enumerating serials. | **[implemented]/[tested]** |
+| **Emergency rotation** | Same mechanism as recovery used proactively: issue epoch N+1 and a floor=N+1 authorization to cut over immediately (vs. scheduled rotation, which overlaps for zero downtime). | **[implemented]/[tested]** |
+| **Revocation propagation** | CRLs carry a strictly-monotonic `crl_number`; `TrustStore.install_crl` rejects a lower-numbered CRL as a **rollback** (an attacker cannot replay an old CRL to un-revoke). | **[implemented]/[tested]** |
+
+See §1A for the recovery/rotation/propagation detail and `OFFLINE_PROVISIONING.md`
+for the air-gap distribution model.
 
 ### Trust model
 
@@ -56,10 +63,67 @@ Enrollment requests and revocation lists use the same length-prefixed, domain-
 separated scheme. Domain-separation labels (`…credential v1`, `…enrollment-request
 v1`, `…revocation-list v1`) prevent cross-protocol signature reuse.
 
+## 1A. Recovery, emergency rotation, renewal, and revocation propagation
+
+### Rotation modes (zero-downtime vs emergency)
+
+- **Scheduled / zero-downtime rotation** [implemented]/[tested]: issue the new
+  credential (new key, epoch N+1) with a validity window that **overlaps** the
+  old one. Both verify during the overlap, so there is no trust gap; the old
+  credential expires on its own. Do *not* raise the epoch floor — both are valid.
+  Test: `rotation_gives_uninterrupted_trust_through_a_handshake`.
+- **Emergency rotation** [implemented]/[tested]: issue epoch N+1 **and** a
+  `RecoveryAuthorization` with `epoch_floor = N+1`. A relying peer that installs
+  it rejects the old epoch *immediately* (`Superseded`) — the cut-over is instant,
+  not gated on the old credential's expiry. Same machinery as recovery.
+
+### Renewal (same key) [implemented]/[tested]
+
+Before expiry, the node re-requests with the **same** signer; the CA issues a new
+credential (same public key, same epoch, later window). The identity is
+continuous (same keys), only the validity is extended. Distinct from rotation
+(which changes the key). Test: `renewal_extends_validity_with_continuity`.
+
+### Recovery — lost key and compromised node [implemented]/[tested]
+
+A node that **lost** its private key cannot prove possession of the old key. A
+**compromised** node's key is in an attacker's hands, so its credential is
+cryptographically valid. Both are handled by the same authority-driven flow:
+
+1. The node (or operator) generates a **new** hybrid keypair and enrols it
+   normally (proof-of-possession on the *new* key).
+2. The CA issues a new credential at **epoch N+1** and a **`RecoveryAuthorization`**
+   with `epoch_floor = N+1` (and, for compromise, also a CRL revoking the old
+   serial).
+3. Relying peers `install_recovery(&authz)` → the old identity is `Superseded`;
+   the new one verifies and drives the handshake.
+
+Why the recovery authorization (not just a CRL)? It is **node-scoped and
+epoch-based**, so it supersedes the entire prior identity without enumerating
+every old serial, works **offline** (one small signed blob), and does not depend
+on the old credential's expiry. It is unforgeable without the CA key
+(`forged_recovery_authorization_is_rejected`) and node-scoped
+(`recovery_floor_is_node_scoped`). Tests:
+`recovery_supersedes_lower_epoch_and_admits_new`,
+`compromised_node_workflow_revoke_and_supersede`,
+`recovered_identity_drives_handshake_old_is_superseded`.
+
+### Revocation propagation (monotonic CRLs) [implemented]/[tested]
+
+Each CRL carries a strictly-increasing `crl_number`. `TrustStore.install_crl`
+verifies the CA signature + freshness, then requires `crl_number` to exceed the
+last installed — a lower-numbered CRL is rejected as `CrlRollback`. This defeats
+an attacker who would replace a CRL revoking a compromised serial with an older
+one that omits it. A *newer* CRL that drops a serial legitimately un-revokes it.
+Installed CRLs are re-checked for **freshness at every verify** (a CRL gone past
+`next_update` ⇒ `StaleRevocationList`, so "not revoked" is never trusted from a
+stale list). Tests: `crl_rollback_is_rejected`,
+`installed_stale_crl_is_rejected_at_verify_time`.
+
 ## 2. Validation evidence — **[measured]**, this run
 
-`cargo test --lib identity` (14 unit tests) + `cargo test --test
-identity_lifecycle_tests` (5 integration tests), all pass:
+`cargo test --lib identity` (**21 unit tests**) + `cargo test --test
+identity_lifecycle_tests` (**7 integration tests**), all pass:
 
 | Property | Test |
 |---|---|
@@ -74,7 +138,14 @@ identity_lifecycle_tests` (5 integration tests), all pass:
 | Stale CRL rejected (can't trust "not revoked") | `stale_revocation_list_is_rejected` |
 | Forged CRL (wrong CA) rejected | `forged_revocation_list_is_rejected` |
 | Offline bytes-only round-trip verifies | `offline_provisioning_round_trip` |
-| Arbitrary truncations never panic | `malformed_blobs_never_panic` |
+| Arbitrary truncations never panic (cred/CRL/authz) | `malformed_blobs_never_panic` |
+| **Recovery supersedes lower epoch, admits new** | `recovery_supersedes_lower_epoch_and_admits_new` |
+| **Recovery floor is node-scoped** | `recovery_floor_is_node_scoped` |
+| **Forged recovery authorization rejected** | `forged_recovery_authorization_is_rejected` |
+| **Compromised-node: revoke + supersede** | `compromised_node_workflow_revoke_and_supersede` |
+| **CRL rollback rejected; newer un-revokes** | `crl_rollback_is_rejected` |
+| **Installed stale CRL rejected at verify** | `installed_stale_crl_is_rejected_at_verify_time` |
+| **Renewal extends validity with continuity** | `renewal_extends_validity_with_continuity` |
 
 **End-to-end (lifecycle → real handshake):**
 
@@ -84,11 +155,45 @@ identity_lifecycle_tests` (5 integration tests), all pass:
 | Expired peer credential ⇒ no trusted keys ⇒ no channel | `expired_peer_credential_blocks_trust_and_handshake` |
 | Revoked peer credential ⇒ trust refused | `revoked_peer_credential_blocks_trust` |
 | Rotated credential drives a handshake during the overlap | `rotation_gives_uninterrupted_trust_through_a_handshake` |
+| **Recovered identity drives a handshake; old superseded** | `recovered_identity_drives_handshake_old_is_superseded` |
 | Air-gapped (bytes-only) provisioning round-trip | `air_gapped_bytes_only_provisioning` |
+| **Offline recovery distribution (authz + CRL bytes)** | `offline_recovery_distribution_bytes_only` |
 
 The new module is also pure-logic and therefore covered by the project's Miri /
 property-test discipline (`docs/FAIL_CLOSED_ASSURANCE.md`): `malformed_blobs_never_panic`
-is the in-module fuzz-style robustness check.
+is the in-module fuzz-style robustness check (credential, CRL, and recovery-authz
+truncations).
+
+## 2A. Benchmarks — **[measured]** (`cargo bench --bench identity_benchmarks`)
+
+Median of n=200 on this shared sandbox host (CPU-only; **not** target hardware —
+numbers localise cost, they are not a fielded claim). ML-DSA-65 signing latency is
+intrinsically **variable** (FIPS-204 rejection sampling), so CA-sign operations
+show wide spread; verify and PoP are stable.
+
+| Operation | Median latency |
+|---|---:|
+| Enrollment (hybrid keygen + PoP sign) | ~1 088 µs |
+| Proof-of-possession verify | ~324 µs |
+| Issue credential (CA hybrid sign) | ~602 µs |
+| Verify credential (relying peer) | ~325 µs |
+| Issue revocation list (CA hybrid sign) | ~1 824 µs* |
+| Authorize recovery (CA hybrid sign) | ~2 089 µs* |
+
+\* the CA-sign spread (issue vs revoke/recovery) reflects ML-DSA rejection-sampling
+variance, not algorithmic difference — all are one hybrid sign.
+
+| Artifact | Size |
+|---|---:|
+| Enrollment request | 5 381 B |
+| Identity credential | 5 409 B |
+| Revocation list (3 serials) | 3 429 B |
+| Recovery authorization | 3 405 B |
+
+Sizes are dominated by the ML-DSA-65 public key (1 952 B) and signature (3 309 B).
+These are the bytes a courier carries for air-gap provisioning
+(`OFFLINE_PROVISIONING.md`); a credential + recovery-authz + small CRL is well
+under 15 KB total — trivially transportable on any offline medium.
 
 ## 3. Integration with the handshake
 
