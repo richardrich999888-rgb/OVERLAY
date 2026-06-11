@@ -183,6 +183,10 @@ async fn handle_passed_fd(
     };
 
     // Take ownership of the passed socket and feed it to the negotiation engine.
+    // SAFETY: `fd` was just received via `recv_fd` (SCM_RIGHTS), which returns a
+    // descriptor the kernel duplicated into this process and that nothing else
+    // owns. `from_raw_fd` takes sole ownership; it is closed via the resulting
+    // `TcpStream` (or the kTLS bridge), never double-closed.
     let std_tcp = unsafe { std::net::TcpStream::from_raw_fd(fd) };
     std_tcp.set_nonblocking(true)?;
     let stream = TcpStream::from_std(std_tcp)?;

@@ -7,6 +7,13 @@
 //! All cryptography lives in `crypto` and is free of FFI/network side effects.
 //! Runtime cipher agility (suite selection, negotiation, transcript binding)
 //! lives in `crypto::{mod, generic, nist768, nist1024}`.
+//!
+//! Fail-closed lint hardening: an ignored `Result`/`#[must_use]` value on a
+//! security path (e.g. a dropped error from a seal/close/teardown) is a
+//! fail-*open* bug, so a dropped must-use value is a hard error crate-wide.
+//! See `docs/FAIL_CLOSED_VALIDATION.md` for the unsafe-code audit and the
+//! property/concurrency assurance evidence.
+#![deny(unused_must_use)]
 
 #[cfg(feature = "cdac-accel")]
 pub mod accelerator;

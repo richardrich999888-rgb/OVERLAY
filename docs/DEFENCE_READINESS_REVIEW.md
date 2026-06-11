@@ -27,7 +27,8 @@ yet backed by committed evidence.
 |---|---|---|---|---|
 | **C6** | Handshake-flood CPU exhaustion: PQC work performed before peer validation | High → **Low** | **Mitigated — gate on the real daemon path; per-source + global caps; validated in-process, on the wire, and against the spawned daemon** | `docs/HANDSHAKE_DOS_HARDENING.md`; `src/handshake_guard.rs`; `src/bin/daemon.rs`; `src/over_socket.rs`; `tests/handshake_dos_tests.rs`, `tests/handshake_dos_integration.rs`, `tests/chaos_orchestration.rs` |
 | (PQC-2) | Long-session key-wear, no anti-replay/rekey on lossy links | Med | **Mitigated (record layer implemented + tested)** | `docs/PQC_PROTOCOL_SPEC.md §4`; `src/crypto/session.rs`; `tests/session_hardening_tests.rs` |
-| C1–C5, C7+ | Universal interception, identity lifecycle, resilience (`tc netem`), sovereign/ARM, formal fail-closed (Miri/Loom/fuzz) | — | **Open / tracked** | Not runnable in the current sandbox; scoped as host-only / future increments (see §4) |
+| **FC-1** | Fail-closed assurance gap: no automated proof of no-cleartext / no-panic / concurrency safety; 85/86 `unsafe` blocks undocumented | High → **Low–Medium** | **Mitigated in-sandbox (property + concurrency proof, unsafe audit, lint hardening); Miri/Loom/fuzz committed but blocked-on-nightly** | `docs/FAIL_CLOSED_VALIDATION.md`; `tests/fail_closed_properties.rs`, `tests/concurrency_stress.rs`; `src/lib.rs` (`#![deny(unused_must_use)]`); `fuzz/`, `scripts/run_miri.sh` |
+| C1–C5, C7 | Universal interception (eBPF), identity lifecycle (TPM/HSM/air-gap), resilience (`tc netem`), sovereign/ARM | — | **Open / tracked** | Not runnable in the current sandbox; host-only / future increments (see §4) |
 
 > The original review's full C-series text was a chat-only artifact. Rather than
 > restate findings whose details are not yet backed by committed evidence, this
@@ -143,6 +144,52 @@ remain to fully retire the residual — both tracked, neither a CPU-DoS.
 
 ---
 
+## 2A. Reassessment — Finding FC-1 (fail-closed assurance)
+
+**Previous state.** The platform's core promise — *never emit plaintext, never
+crash on adversarial input, fail closed on every error* — rested on hand-review
+and scattered unit tests. There was **no automated proof** of the no-cleartext /
+no-panic invariants under adversarial input or concurrency, and **85 of 86
+`unsafe` blocks carried no `// SAFETY:` justification**. A single fail-open parser
+bug or an unrejected tamper would defeat the entire mission.
+
+**Current state.** The load-bearing invariants are now under automated, seeded,
+reproducible proof, the security-critical v2 `unsafe` is documented, and a
+fail-open-class lint is enforced crate-wide:
+
+- **No-cleartext + tamper + parser robustness** (`tests/fail_closed_properties.rs`).
+- **Concurrency safety** on the real shared guard (`tests/concurrency_stress.rs`).
+- **`#![deny(unused_must_use)]`** crate-wide — a swallowed seal/close/teardown
+  error (a fail-*open* bug) is now a compile error; the tree is clean under it.
+- **Unsafe audit** (`docs/FAIL_CLOSED_VALIDATION.md §5`): all 86 blocks classified
+  with their fail-closed property; SCM_RIGHTS fd-passing + the received-fd adoption
+  annotated inline.
+
+**Evidence generated** (**[measured]**, this run):
+
+| Invariant | Volume | Result |
+|---|---:|---|
+| No cleartext canary (fallback + PQC, both suites) | 21 000 records | **0 leaks** |
+| Tamper ⇒ fail closed | 20 000 tampered records | **0 fail-open** |
+| Parsers never panic / leak (4 parsers) | 50 000 random inputs | **0 panics, 0 leaks** |
+| Anti-replay never double-accepts | 400 000 ops | **0 double-accepts** |
+| Cookie no false-accept | ~20 000 mutations | **0 false-accepts** |
+| Concurrency cap never exceeded | 16 threads, cap 4, 75 664 acquisitions | **max in-flight = 4** |
+| No deadlock / no slot leak | 12 threads × 5 000 | **final in-flight = 0** |
+| Poisoned guard | production `.lock()` pattern | **fail-closed error, no panic** |
+
+**Honest boundary (blocked-on-infra).** Miri (UB), Loom (exhaustive interleaving),
+and cargo-fuzz (continuous fuzzing) need a **nightly** toolchain absent from this
+sandbox. Real harnesses are committed (`fuzz/`, `scripts/run_miri.sh`) and run on a
+host; they are **not** claimed as validated here. The in-sandbox property + stress
+suites bound, but do not replace, them.
+
+**Readiness impact.** FC-1 moves **High → Low–Medium**. The fail-open and
+crash-on-input failure modes are now disproven across hundreds of thousands of
+adversarial inputs and real-thread interleavings; residual is the absence of a
+*nightly CI runner* for UB/exhaustive/continuous proof (R2 in the report), not an
+unaddressed code weakness.
+
 ## 3. Delivered hardening increments (this branch)
 
 1. **PQC record-layer hardening (PQC-2).** Explicit sequencing, IPsec/DTLS-style
@@ -155,8 +202,12 @@ remain to fully retire the residual — both tracked, neither a CPU-DoS.
    *and* global (aggregate PQC-rate + in-flight concurrency) limits. Validated
    in-process (real `respond()` counts), on the wire (gated path), and against the
    spawned daemon binary. This document, §2.
+3. **Fail-closed assurance (FC-1).** Automated property + concurrency proof of the
+   no-cleartext / no-panic / cap-never-exceeded invariants, unsafe-code audit, and
+   `#![deny(unused_must_use)]` lint hardening; Miri/Loom/fuzz harnesses committed
+   host-only. This document, §2A.
 
-Both are pure-Rust, fully tested in-sandbox, and add no packages to the
+All three are pure-Rust, fully tested in-sandbox, and add no packages to the main
 dependency tree.
 
 ---
@@ -174,6 +225,11 @@ not be read as validated:
 - **Identity lifecycle** (enrolment/rotation/revocation/expiry, TPM2/PKCS#11/HSM,
   air-gap provisioning).
 - **Sovereign ARM64** hardware validation.
+- **Miri / Loom / cargo-fuzz** (UB detection, exhaustive interleaving proof,
+  continuous fuzzing) for FC-1 — require a **nightly** toolchain; real harnesses
+  are committed (`fuzz/`, `scripts/run_miri.sh`) and run on a host (see
+  `docs/FAIL_CLOSED_VALIDATION.md §6`). The in-sandbox property + concurrency
+  suites are the deterministic stand-in that *is* validated here.
 - **Formal fail-closed assurance** (Miri/Loom/fuzzing/property-model-checking).
 
 ---
@@ -187,7 +243,9 @@ cargo build --release --locked
 cargo test --release --locked
 cargo test --test handshake_dos_tests --test handshake_dos_integration \
            --test session_hardening_tests -- --nocapture
+cargo test --test fail_closed_properties --test concurrency_stress -- --nocapture
 cargo test --test chaos_orchestration     # spawns the real daemon binary
+# host-only (nightly): scripts/run_miri.sh ; cargo +nightly fuzz run cookie_parse
 ```
 
 All gates pass in this environment at the current HEAD.

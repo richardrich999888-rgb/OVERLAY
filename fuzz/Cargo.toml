@@ -1,0 +1,54 @@
+# Out-of-tree fuzzing crate for the Syntriass overlay (cargo-fuzz / libFuzzer).
+#
+# INTENTIONALLY a standalone workspace root (note the empty `[workspace]` table)
+# so the main `syntriass-overlay` package is never disturbed by it: the root
+# `cargo build`/`test`/`clippy --locked` do not see this crate, and this crate is
+# NOT in the main `Cargo.lock`.
+#
+# It is HOST-ONLY: it requires a nightly toolchain + `cargo-fuzz` + libFuzzer,
+# which are not present in the CI sandbox. It is therefore NOT executed there and
+# NOT claimed as validated. See `fuzz/README.md` and `docs/FAIL_CLOSED_VALIDATION.md`.
+#
+#   rustup toolchain install nightly
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run cookie_parse
+[package]
+name = "syntriass-overlay-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.syntriass-overlay]
+path = ".."
+
+[[bin]]
+name = "cookie_parse"
+path = "fuzz_targets/cookie_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "kernel_event_parse"
+path = "fuzz_targets/kernel_event_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "session_open"
+path = "fuzz_targets/session_open.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "handshake_respond"
+path = "fuzz_targets/handshake_respond.rs"
+test = false
+doc = false
