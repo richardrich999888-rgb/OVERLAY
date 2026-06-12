@@ -354,10 +354,18 @@ impl KtlsError {
     /// genuine misconfiguration. Callers use this to skip (tests) or fail
     /// closed with a precise reason (daemon).
     pub fn is_unsupported(&self) -> bool {
-        matches!(
+        if matches!(
             self.errno,
             libc::ENOENT | libc::EOPNOTSUPP | libc::ENOPROTOOPT | libc::EPROTONOSUPPORT
-        )
+        ) {
+            return true;
+        }
+        // EINVAL is stage-dependent: at the ULP attach it means the syscall layer
+        // does not know TCP_ULP at all (observed under qemu-user emulation, which
+        // answers EINVAL for untranslated sockopts) — i.e. kTLS is unavailable.
+        // At any later stage (TLS_TX/TLS_RX key install) EINVAL is a genuine
+        // misconfiguration and must surface as a real error, not a skip.
+        self.errno == libc::EINVAL && self.stage == "TCP_ULP=tls"
     }
 }
 
@@ -437,9 +445,18 @@ pub fn ktls_supported() -> bool {
         if rc == 0 {
             return true;
         }
+        // ENOENT/EOPNOTSUPP/ENOPROTOOPT/EPROTONOSUPPORT: the kernel has no TLS
+        // ULP. EINVAL: the syscall layer doesn't know TCP_ULP at all (seen under
+        // qemu-user emulation, which returns EINVAL for untranslated sockopts; a
+        // real kTLS host answers ENOTCONN on an unconnected probe, never EINVAL).
+        // All of these mean "kTLS unavailable" — the fail-closed reading.
         !matches!(
             errno,
-            libc::ENOENT | libc::EOPNOTSUPP | libc::ENOPROTOOPT | libc::EPROTONOSUPPORT
+            libc::ENOENT
+                | libc::EOPNOTSUPP
+                | libc::ENOPROTOOPT
+                | libc::EPROTONOSUPPORT
+                | libc::EINVAL
         )
     }
 }
