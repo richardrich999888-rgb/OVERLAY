@@ -132,9 +132,9 @@ costs are not conflated.
 
 | Metric | Value |
 |---|---:|
-| per-policy object (`value_size`) | **72 bytes** |
-| key + value per entry | 80 bytes |
-| `policy_table` value reservation at 4096-policy capacity | 294 912 bytes (~288 KiB) |
+| per-policy object (`value_size`) | **72 bytes** (Phase 1) → **80 bytes** after Phase 3 added `crypto_flags` (`docs/CRYPTO_POLICY.md`) |
+| key + value per entry | 80 → 88 bytes |
+| `policy_table` value reservation at 4096-policy capacity | 294 912 → 327 680 bytes (~320 KiB) |
 
 `BPF_MAP_TYPE_HASH` preallocates its entries, so the table reserves
 `(key+value+node)·max_entries` up front; the reported 288 KiB is the value

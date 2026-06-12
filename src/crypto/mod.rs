@@ -11,6 +11,7 @@
 //!   * `nist768`  - X25519 + ML-KEM-768  (suite id 0x01).
 //!   * `nist1024` - X25519 + ML-KEM-1024 (suite id 0x02).
 
+pub mod crypto_policy;
 pub mod fallback;
 mod generic;
 pub mod nist1024;

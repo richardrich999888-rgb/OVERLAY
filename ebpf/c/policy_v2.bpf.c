@@ -35,6 +35,17 @@
 #define REASON_NO_POLICY 1u
 #define REASON_EXPIRED 2u
 #define REASON_FAILCLOSED 3u
+#define REASON_CRYPTO 4u // crypto policy forbids this connection (e.g. a fallback)
+
+// Cryptographic policy flags (Phase 3). The kernel enforces the data-plane
+// *consequence* it can see — whether a fallback (EncryptedFallback) connection is
+// permitted; the suite/hardware-key requirements are enforced at handshake time
+// by the daemon (it sees the negotiated suite; the connect4 hook does not).
+#define CRYPTO_FULL_PQC_ONLY (1u << 0)    // forbid any fallback connection
+#define CRYPTO_HYBRID_ONLY (1u << 1)      // require X25519+ML-KEM (handshake-time)
+#define CRYPTO_FALLBACK_ALLOWED (1u << 2) // permit the encrypted PSK fallback
+#define CRYPTO_HARDWARE_KEY_REQ (1u << 3) // require a hardware-backed key (handshake-time)
+#define CRYPTO_NO_CLASSICAL_FB (1u << 4)  // forbid any classical-only fallback
 
 // The structured policy object. Field order keeps the three u64s first so the
 // 32-byte identity hash and the u32s stay naturally aligned; total 72 bytes.
@@ -46,6 +57,7 @@ struct syntriass_policy {
     __u32 interface_id;           // ifindex this policy binds to; 0 = any
     __u32 posture;                // MODE_FULL_PQC / _ENCRYPTED_FALLBACK / _FAIL_CLOSED
     __u32 priority;               // higher wins on conflict (Phase 2 hierarchy)
+    __u32 crypto_flags;           // CRYPTO_* bitmask (Phase 3)
     __u8 fallback_allowed;        // may degrade to EncryptedFallback (1) or not (0)
     __u8 audit_enabled;           // emit a ring-buffer audit record (1) or not (0)
     __u8 _pad[2];
@@ -255,6 +267,20 @@ int syntriass_policy_hier(struct bpf_sock_addr *ctx) {
     }
     __u16 decision = (posture == MODE_FAIL_CLOSED) ? 1 : 0;
 
+    // Crypto policy gate (Phase 3): the kernel enforces the consequence it can
+    // see — is a fallback (EncryptedFallback) connection permitted at all? It is
+    // only permitted when FALLBACK_ALLOWED is set and FullPqcOnly does not forbid
+    // it; otherwise fail closed (REASON_CRYPTO). The *nature* of the fallback
+    // (classical vs symmetric, NO_CLASSICAL_FB) and the suite/hardware-key
+    // requirements are enforced at handshake time by the daemon, which sees them.
+    if (decision == 0 && pol && posture == MODE_ENCRYPTED_FALLBACK) {
+        __u32 cf = pol->crypto_flags;
+        if ((cf & CRYPTO_FULL_PQC_ONLY) || !(cf & CRYPTO_FALLBACK_ALLOWED)) {
+            decision = 1;
+            reason = REASON_CRYPTO;
+        }
+    }
+
     if (decision == 0) {
         __u8 st = (__u8)(posture + 1);
         bpf_map_update_elem(&session_state, &flowkey, &st, BPF_ANY);
@@ -291,7 +317,13 @@ int syntriass_policy_hier_bench(struct bpf_sock_addr *ctx) {
     __u32 level = LEVEL_GLOBAL;
     struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
     if (!pol) return 0;
-    return (pol->posture == MODE_FAIL_CLOSED) ? 0 : 1;
+    if (pol->posture == MODE_FAIL_CLOSED) return 0;
+    if (pol->posture == MODE_ENCRYPTED_FALLBACK) {
+        __u32 cf = pol->crypto_flags;
+        if ((cf & CRYPTO_FULL_PQC_ONLY) || !(cf & CRYPTO_FALLBACK_ALLOWED))
+            return 0; // crypto policy forbids the fallback
+    }
+    return 1;
 }
 
 char LICENSE[] SEC("license") = "GPL";

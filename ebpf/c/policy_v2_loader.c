@@ -47,6 +47,7 @@ struct syntriass_policy {
     unsigned int interface_id;
     unsigned int posture;
     unsigned int priority;
+    unsigned int crypto_flags;
     unsigned char fallback_allowed;
     unsigned char audit_enabled;
     unsigned char _pad[2];
@@ -91,6 +92,7 @@ static const char *reason_str(unsigned r) {
     case 1: return "no-policy";
     case 2: return "expired";
     case 3: return "failclosed-posture";
+    case 4: return "crypto-policy";
     default: return "?";
     }
 }
@@ -177,13 +179,15 @@ static int run_bench(int argc, char **argv) {
 // Build a full policy object with explicit priority/expiry, push it to a given
 // map fd at a given key, return the update latency in us.
 static long push_to(int fd, const void *key, unsigned posture, unsigned prio,
-                    unsigned long long policy_id, unsigned long long expiry_ns) {
+                    unsigned long long policy_id, unsigned long long expiry_ns,
+                    unsigned crypto_flags) {
     struct syntriass_policy p;
     memset(&p, 0, sizeof(p));
     p.policy_id = policy_id;
     p.expiry_ns = expiry_ns;
     p.posture = posture;
     p.priority = prio;
+    p.crypto_flags = crypto_flags;
     p.fallback_allowed = 1;
     p.audit_enabled = 1;
     long t = now_us();
@@ -215,16 +219,18 @@ static long apply_spec(int g_fd, int n_fd, int s_fd, unsigned long long probe_cg
     char buf[512];
     snprintf(buf, sizeof(buf), "%s", spec);
     for (char *tok = strtok(buf, " ,"); tok; tok = strtok(NULL, " ,")) {
-        unsigned lvl, posture, prio, exp;
-        if (sscanf(tok, "%u:%u:%u:%u", &lvl, &posture, &prio, &exp) != 4) continue;
+        unsigned lvl, posture, prio, exp, crypto = 0;
+        // token: L:posture:prio:exp[:crypto_flags]
+        int got = sscanf(tok, "%u:%u:%u:%u:%u", &lvl, &posture, &prio, &exp, &crypto);
+        if (got < 4) continue;
         unsigned long long expiry = exp ? 1ULL : 0ULL; // 1ns => already expired
         unsigned long long pid = 0x10000ULL + lvl * 0x1000 + prio; // nonzero id
         long us = 0;
         switch (lvl) {
-        case 0: us = push_to(g_fd, &z, posture, prio, pid, expiry); break;
-        case 1: us = push_to(n_fd, &z, posture, prio, pid, expiry); break;
-        case 2: us = push_to(g_pol_fd, &probe_cgid, posture, prio, pid, expiry); break;
-        case 3: us = push_to(s_fd, &flowkey, posture, prio, pid, expiry); break;
+        case 0: us = push_to(g_fd, &z, posture, prio, pid, expiry, crypto); break;
+        case 1: us = push_to(n_fd, &z, posture, prio, pid, expiry, crypto); break;
+        case 2: us = push_to(g_pol_fd, &probe_cgid, posture, prio, pid, expiry, crypto); break;
+        case 3: us = push_to(s_fd, &flowkey, posture, prio, pid, expiry, crypto); break;
         default: continue;
         }
         if (us > maxus) maxus = us;
