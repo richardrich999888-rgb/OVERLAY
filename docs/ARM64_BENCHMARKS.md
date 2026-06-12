@@ -82,6 +82,8 @@ policy numbers are **[design]**.
 rustup target add aarch64-unknown-linux-gnu
 apt-get install gcc-aarch64-linux-gnu qemu-user-static
 export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"
 SYNTRIASS_EMULATED=1 cargo test  --release --locked --target aarch64-unknown-linux-gnu
 cargo bench --locked --target aarch64-unknown-linux-gnu --bench oob_benchmarks
 cargo bench --locked --target aarch64-unknown-linux-gnu --bench identity_benchmarks

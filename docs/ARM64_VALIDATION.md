@@ -22,15 +22,13 @@ makes **functional correctness on the ARM64 ISA a real, measured result**, and
 
 ## 1. Toolchain & repeatability — **[implemented]**
 
-Committed configuration (`.cargo/config.toml`):
+The emulated cross-run is driven entirely by **environment variables** — there is
+deliberately **no committed `.cargo/config.toml`**, because hard-coding a
+`qemu-aarch64-static` runner/linker there would break a *native* ARM64 build
+(the CI `ubuntu-24.04-arm` runner, and real Graviton/Ampere hardware), where
+aarch64 is the host target and no emulator is wanted.
 
-```toml
-[target.aarch64-unknown-linux-gnu]
-linker = "aarch64-linux-gnu-gcc"
-runner = ["qemu-aarch64-static", "-L", "/usr/aarch64-linux-gnu"]
-```
-
-Host prerequisites (Ubuntu 24.04):
+Host prerequisites (Ubuntu 24.04 x86_64 host, for the emulated run):
 
 ```sh
 rustup target add aarch64-unknown-linux-gnu
@@ -39,11 +37,20 @@ apt-get install gcc-aarch64-linux-gnu qemu-user-static
 mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc   # if not mounted
 printf ':qemu-aarch64:M::\x7fELF...:\xff...:/usr/bin/qemu-aarch64-static:F' \
   > /proc/sys/fs/binfmt_misc/register
-export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu               # sysroot for binfmt execs
 ```
 
-Run contract: `QEMU_LD_PREFIX=... SYNTRIASS_EMULATED=1 cargo test --release
---locked --target aarch64-unknown-linux-gnu`. `SYNTRIASS_EMULATED=1` switches
+Run contract (emulated, x86_64 host):
+
+```sh
+export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu               # sysroot for binfmt execs
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64-static -L /usr/aarch64-linux-gnu"
+SYNTRIASS_EMULATED=1 cargo test --release --locked --target aarch64-unknown-linux-gnu
+```
+
+On a **native** ARM64 host (the CI runner, Graviton) none of the above is needed
+— `cargo test --release --locked` runs the binaries directly.
+`SYNTRIASS_EMULATED=1` switches
 two latency assertions from per-iteration *max* to *mean* (a single emulated
 iteration can absorb a multi-ms QEMU translation pause that says nothing about
 the platform); all functional assertions are unchanged.
