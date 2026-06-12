@@ -31,6 +31,7 @@ pub mod identity;
 pub mod interceptor;
 pub mod kernel_native;
 pub mod keystore;
+pub mod kinetic;
 pub mod over_socket;
 pub mod telemetry;
 
