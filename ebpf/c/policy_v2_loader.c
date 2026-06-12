@@ -60,6 +60,16 @@ struct policy_event {
     unsigned int level, _evpad;
 };
 
+struct quarantine_entry {
+    unsigned long long quarantine_id;
+    unsigned long long expiry_ns;
+    unsigned int kind;
+    unsigned int _qpad;
+};
+#define QUAR_TEMPORARY 0u
+#define QUAR_PERMANENT 1u
+#define QUAR_AUTO_EXPIRY 2u
+
 static int g_pol_fd = -1, g_sess_fd = -1;
 
 static const char *level_str(unsigned l) {
@@ -78,6 +88,11 @@ static long now_us(void) {
     return t.tv_sec * 1000000 + t.tv_nsec / 1000;
 }
 static long now_ms(void) { return now_us() / 1000; }
+static unsigned long long now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ULL + (unsigned long long)t.tv_nsec;
+}
 
 // cgroup id == inode number of the cgroupfs directory.
 static unsigned long long cgid_of(const char *path) {
@@ -93,6 +108,7 @@ static const char *reason_str(unsigned r) {
     case 2: return "expired";
     case 3: return "failclosed-posture";
     case 4: return "crypto-policy";
+    case 5: return "quarantine";
     default: return "?";
     }
 }
@@ -336,10 +352,127 @@ static int run_hierbench(int argc, char **argv) {
     return 0;
 }
 
+// Quarantine correctness/recovery run: install a FullPqc app policy (so absent
+// quarantine => allow), quarantine the probe cgroup, attach the hierarchical
+// program, optionally manually release at release_ms. The script connects before
+// and after expiry / release to observe deny -> auto/manual recovery.
+//   quar <attach> <probe> <sport> <run_ms> <kind> <duration_ms> <release_ms>
+//   kind: 0=Temporary 1=Permanent 2=AutoExpiry ; release_ms < 0 => no manual release
+static int run_quar(int argc, char **argv) {
+    if (argc < 8) { fprintf(stderr, "usage: quar <attach> <probe> <sport> <run_ms> <kind> <dur_ms> <rel_ms>\n"); return 1; }
+    const char *cg = argv[2];
+    unsigned long long probe_cgid = cgid_of(argv[3]);
+    int run_ms = atoi(argv[5]);
+    unsigned kind = (unsigned)atoi(argv[6]);
+    long dur_ms = atol(argv[7]);
+    long rel_ms = (argc > 8) ? atol(argv[8]) : -1;
+
+    struct bpf_object *obj = bpf_object__open_file("policy_v2.bpf.o", NULL);
+    if (!obj || bpf_object__load(obj)) { fprintf(stderr, "quar load fail\n"); return 2; }
+    g_pol_fd = bpf_object__find_map_fd_by_name(obj, "policy_table");
+    int ev_fd = bpf_object__find_map_fd_by_name(obj, "events");
+    int q_fd = bpf_object__find_map_fd_by_name(obj, "quarantine");
+    struct bpf_program *p = bpf_object__find_program_by_name(obj, "syntriass_policy_hier");
+    int cgfd = open(cg, O_RDONLY | O_DIRECTORY);
+    if (cgfd < 0) { perror("open cgroup"); return 3; }
+    struct bpf_link *link = bpf_program__attach_cgroup(p, cgfd);
+    if (!link) { fprintf(stderr, "quar attach fail\n"); return 4; }
+    struct ring_buffer *rb = ring_buffer__new(ev_fd, on_event, NULL, NULL);
+
+    // Baseline allow policy at the app level.
+    push_policy_ex(probe_cgid, MODE_FULL_PQC, 0xF0001, 0);
+
+    // Install the quarantine (timed = propagation latency).
+    struct quarantine_entry q;
+    memset(&q, 0, sizeof(q));
+    q.quarantine_id = 0xC0001;
+    q.kind = kind;
+    q.expiry_ns = (dur_ms > 0) ? now_ns() + (unsigned long long)dur_ms * 1000000ULL : 0;
+    long t = now_us();
+    bpf_map_update_elem(q_fd, &probe_cgid, &q, BPF_ANY);
+    long propus = now_us() - t;
+    printf("QSET kind=%u dur_ms=%ld rel_ms=%ld prop_us=%ld\n", kind, dur_ms, rel_ms, propus);
+    fflush(stdout);
+    fprintf(stderr, "READY\n"); fflush(stderr);
+
+    long start = now_ms();
+    int released = 0;
+    while (now_ms() < start + run_ms) {
+        if (!released && rel_ms >= 0 && (now_ms() - start) >= rel_ms) {
+            long tr = now_us();
+            bpf_map_delete_elem(q_fd, &probe_cgid);
+            printf("QREL us=%ld\n", now_us() - tr);
+            fflush(stdout);
+            released = 1;
+        }
+        ring_buffer__poll(rb, 50);
+    }
+    ring_buffer__free(rb);
+    bpf_link__destroy(link);
+    close(cgfd);
+    bpf_object__close(obj);
+    return 0;
+}
+
+// Quarantine enforcement-latency bench: app FullPqc + a PERMANENT quarantine on
+// the probe cgroup; attach the lookup-only hierarchical program; the script
+// bursts connects (all denied by quarantine), and we report the kernel run-time.
+//   quarbench <attach> <probe> <sport> <run_ms>
+static int run_quarbench(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: quarbench <attach> <probe> <sport> <run_ms>\n"); return 1; }
+    const char *cg = argv[2];
+    unsigned long long probe_cgid = cgid_of(argv[3]);
+    int run_ms = atoi(argv[5]);
+
+    struct bpf_object *obj = bpf_object__open_file("policy_v2.bpf.o", NULL);
+    if (!obj || bpf_object__load(obj)) { fprintf(stderr, "quarbench load fail\n"); return 2; }
+    g_pol_fd = bpf_object__find_map_fd_by_name(obj, "policy_table");
+    int q_fd = bpf_object__find_map_fd_by_name(obj, "quarantine");
+    struct bpf_program *p =
+        bpf_object__find_program_by_name(obj, "syntriass_policy_hier_bench");
+    int prog_fd = bpf_program__fd(p);
+    int stats_fd = bpf_enable_stats(BPF_STATS_RUN_TIME);
+    int cgfd = open(cg, O_RDONLY | O_DIRECTORY);
+    if (cgfd < 0) { perror("open cgroup"); return 3; }
+    struct bpf_link *link = bpf_program__attach_cgroup(p, cgfd);
+    if (!link) { fprintf(stderr, "quarbench attach fail\n"); return 4; }
+
+    push_policy_ex(probe_cgid, MODE_FULL_PQC, 0xF0002, 0);
+    struct quarantine_entry q;
+    memset(&q, 0, sizeof(q));
+    q.quarantine_id = 0x5151;
+    q.kind = QUAR_PERMANENT;
+    q.expiry_ns = 0;
+    bpf_map_update_elem(q_fd, &probe_cgid, &q, BPF_ANY);
+    fprintf(stderr, "READY\n"); fflush(stderr);
+
+    long start = now_ms();
+    while (now_ms() < start + run_ms) usleep(20000);
+
+    struct bpf_prog_info pinfo;
+    unsigned int plen = sizeof(pinfo);
+    memset(&pinfo, 0, sizeof(pinfo));
+    if (bpf_prog_get_info_by_fd(prog_fd, &pinfo, &plen) == 0 && pinfo.run_cnt > 0) {
+        printf("QUARBENCHSTATS run_cnt=%llu run_time_ns=%llu avg_ns=%.1f\n",
+               (unsigned long long)pinfo.run_cnt, (unsigned long long)pinfo.run_time_ns,
+               (double)pinfo.run_time_ns / (double)pinfo.run_cnt);
+    } else {
+        printf("QUARBENCHSTATS unavailable\n");
+    }
+    fflush(stdout);
+    if (stats_fd >= 0) close(stats_fd);
+    bpf_link__destroy(link);
+    close(cgfd);
+    bpf_object__close(obj);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "bench") == 0) return run_bench(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "hier") == 0) return run_hier(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "hierbench") == 0) return run_hierbench(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "quar") == 0) return run_quar(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "quarbench") == 0) return run_quarbench(argc, argv);
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s <attach-cgroup> <run_ms> <schedule> <probe-cgroup> [expired-cgroup]\n",

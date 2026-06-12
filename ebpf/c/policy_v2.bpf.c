@@ -35,7 +35,13 @@
 #define REASON_NO_POLICY 1u
 #define REASON_EXPIRED 2u
 #define REASON_FAILCLOSED 3u
-#define REASON_CRYPTO 4u // crypto policy forbids this connection (e.g. a fallback)
+#define REASON_CRYPTO 4u     // crypto policy forbids this connection (e.g. a fallback)
+#define REASON_QUARANTINE 5u // the cgroup is quarantined — highest-priority deny
+
+// Quarantine kinds (Phase 4).
+#define QUAR_TEMPORARY 0u   // auto-releases at expiry_ns (duration-based)
+#define QUAR_PERMANENT 1u   // never auto-releases; manual release only (delete)
+#define QUAR_AUTO_EXPIRY 2u // auto-releases at expiry_ns (absolute-deadline based)
 
 // Cryptographic policy flags (Phase 3). The kernel enforces the data-plane
 // *consequence* it can see — whether a fallback (EncryptedFallback) connection is
@@ -126,6 +132,32 @@ struct {
     __type(key, __u64); // (daddr<<16 | dport)
     __type(value, struct syntriass_policy);
 } session_policy SEC(".maps");
+
+// Quarantine (Phase 4): a quarantined cgroup is denied ALL egress, overriding
+// every policy level — the highest-priority deny. Temporary/AutoExpiry release
+// automatically at expiry_ns; Permanent only on manual delete.
+struct quarantine_entry {
+    __u64 quarantine_id; // opaque id (audit correlation)
+    __u64 expiry_ns;     // absolute bpf_ktime_get_ns(); 0 = no expiry (Permanent)
+    __u32 kind;          // QUAR_*
+    __u32 _qpad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64); // cgroup_id
+    __type(value, struct quarantine_entry);
+} quarantine SEC(".maps");
+
+// Is this cgroup currently under active quarantine?
+static __always_inline int syntriass_quarantined(__u64 cgid) {
+    struct quarantine_entry *q = bpf_map_lookup_elem(&quarantine, &cgid);
+    if (!q) return 0;
+    if (q->kind == QUAR_PERMANENT) return 1; // never auto-releases
+    // Temporary / AutoExpiry: active until the deadline passes (then auto-release).
+    return (q->expiry_ns != 0 && bpf_ktime_get_ns() <= q->expiry_ns);
+}
 
 // A candidate is applicable if present and not expired. Among applicable
 // candidates the highest priority wins; the macro is invoked from least- to
@@ -252,11 +284,32 @@ int syntriass_policy_hier(struct bpf_sock_addr *ctx) {
     __u64 flowkey = ((__u64)ctx->user_ip4 << 16) | dport;
 
     __u32 level = LEVEL_GLOBAL;
-    struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
-
     __u32 posture;
     __u16 reason;
     __u64 policy_id = 0;
+
+    // Quarantine is the highest-priority deny — it overrides every policy level.
+    if (syntriass_quarantined(cgid)) {
+        struct policy_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+        if (e) {
+            __u64 id = bpf_get_current_pid_tgid();
+            e->policy_id = 0;
+            e->cgroup_id = cgid;
+            e->pid = id >> 32;
+            e->daddr = ctx->user_ip4;
+            e->dport = dport;
+            e->posture = MODE_FAIL_CLOSED;
+            e->decision = 1;
+            e->reason = REASON_QUARANTINE;
+            e->level = level;
+            e->_evpad = 0;
+            bpf_ringbuf_submit(e, 0);
+        }
+        return 0; // deny (EPERM)
+    }
+
+    struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
+
     if (!pol) {
         posture = MODE_FAIL_CLOSED;
         reason = REASON_NO_POLICY; // no applicable policy at any level
@@ -315,6 +368,7 @@ int syntriass_policy_hier_bench(struct bpf_sock_addr *ctx) {
     __u16 dport = bpf_ntohs(ctx->user_port);
     __u64 flowkey = ((__u64)ctx->user_ip4 << 16) | dport;
     __u32 level = LEVEL_GLOBAL;
+    if (syntriass_quarantined(cgid)) return 0; // quarantine short-circuits resolve
     struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
     if (!pol) return 0;
     if (pol->posture == MODE_FAIL_CLOSED) return 0;
