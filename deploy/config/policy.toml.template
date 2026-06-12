@@ -1,0 +1,7 @@
+# SYNTRIASS Overlay — cryptographic policy (/etc/syntriass/policy.toml)
+#
+# suite: the active hybrid PQC cipher suite. One of:
+#   nist768   = X25519 + ML-KEM-768  (default, NIST Level 3)
+#   nist1024  = X25519 + ML-KEM-1024 (NIST Level 5)
+# The SYNTRIASS_SUITE environment variable, if set, overrides this file.
+suite = "nist768"

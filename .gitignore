@@ -22,3 +22,6 @@ benchmarks/mininet_local_range/raw_logs.txt
 /ebpf/c/policy_loader
 /ebpf/c/policy_v2.bpf.o
 /ebpf/c/policy_v2_loader
+
+# deployment packages (built artifacts)
+/dist/

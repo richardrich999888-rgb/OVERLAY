@@ -1,0 +1,40 @@
+[Unit]
+Description=SYNTRIASS Overlay — post-quantum fail-closed comms daemon
+Documentation=file:/usr/local/share/doc/syntriass/DEPLOYMENT_GUIDE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Identity + suite are read from /etc/syntriass/{identity,policy}.toml. The
+# over-socket responder listens on the address below (override per deployment).
+Environment=SYNTRIASS_OVERSOCKET_LISTEN=0.0.0.0:8443
+ExecStartPre=/usr/local/bin/syntriass-overlay-validate-config
+ExecStart=/usr/local/bin/syntriass-daemon
+Restart=on-failure
+RestartSec=2
+
+# --- hardening: least privilege, read-only system, no new privileges ---
+User=syntriass
+Group=syntriass
+DynamicUser=no
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/etc/syntriass
+StateDirectory=syntriass
+RuntimeDirectory=syntriass
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
