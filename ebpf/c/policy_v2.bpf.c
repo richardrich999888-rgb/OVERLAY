@@ -51,6 +51,14 @@ struct syntriass_policy {
     __u8 _pad[2];
 };
 
+// Policy levels (least specific -> most specific). The effective policy is the
+// applicable candidate with the Highest Priority; ties break toward the more
+// specific level (Session > Application > Node > Global).
+#define LEVEL_GLOBAL 0u
+#define LEVEL_NODE 1u
+#define LEVEL_APP 2u
+#define LEVEL_SESSION 3u
+
 // A structured audit/decision record (kernel -> userspace).
 struct policy_event {
     __u64 policy_id;
@@ -61,6 +69,8 @@ struct policy_event {
     __u16 posture;
     __u16 decision; // 0=allow 1=deny
     __u16 reason;   // REASON_*
+    __u32 level;    // resolved level (LEVEL_*) that won the decision
+    __u32 _evpad;
 };
 
 struct {
@@ -81,6 +91,67 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 22);
 } events SEC(".maps");
+
+// Hierarchy levels (Phase 2). policy_table above is the Application level (keyed
+// by cgroup id). Global and Node are singletons; Session is keyed by flow tuple.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct syntriass_policy);
+} global_policy SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct syntriass_policy);
+} node_policy SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64); // (daddr<<16 | dport)
+    __type(value, struct syntriass_policy);
+} session_policy SEC(".maps");
+
+// A candidate is applicable if present and not expired. Among applicable
+// candidates the highest priority wins; the macro is invoked from least- to
+// most-specific level, and `>=` lets a more specific level win an equal-priority
+// tie. `best`, `best_prio`, `best_level`, `now` are the enclosing locals.
+// policy_id == 0 marks an absent/empty slot (ARRAY levels always have index 0
+// present, so absence is encoded by a zeroed object rather than a map miss).
+#define CONSIDER(pptr, lvl)                                                      \
+    do {                                                                         \
+        struct syntriass_policy *_c = (pptr);                                    \
+        if (_c && _c->policy_id != 0 &&                                          \
+            !(_c->expiry_ns != 0 && now > _c->expiry_ns) &&                      \
+            (long long)_c->priority >= best_prio) {                             \
+            best = _c;                                                           \
+            best_prio = (long long)_c->priority;                                 \
+            best_level = (lvl);                                                  \
+        }                                                                        \
+    } while (0)
+
+// Resolve the effective policy across the four levels for this flow. Returns the
+// winning policy (or NULL if no applicable policy exists at any level) and writes
+// the winning level to *out_level.
+static __always_inline struct syntriass_policy *
+syntriass_resolve(__u64 cgid, __u64 flowkey, __u32 *out_level) {
+    __u64 now = bpf_ktime_get_ns();
+    struct syntriass_policy *best = 0;
+    long long best_prio = -1;
+    __u32 best_level = LEVEL_GLOBAL;
+    __u32 z = 0;
+
+    CONSIDER(bpf_map_lookup_elem(&global_policy, &z), LEVEL_GLOBAL);
+    CONSIDER(bpf_map_lookup_elem(&node_policy, &z), LEVEL_NODE);
+    CONSIDER(bpf_map_lookup_elem(&policy_table, &cgid), LEVEL_APP);
+    CONSIDER(bpf_map_lookup_elem(&session_policy, &flowkey), LEVEL_SESSION);
+
+    *out_level = best_level;
+    return best;
+}
 
 SEC("cgroup/connect4")
 int syntriass_policy_v2(struct bpf_sock_addr *ctx) {
@@ -134,6 +205,8 @@ int syntriass_policy_v2(struct bpf_sock_addr *ctx) {
             e->posture = (__u16)posture;
             e->decision = decision;
             e->reason = reason;
+            e->level = LEVEL_APP; // Phase-1 program keys on the cgroup/app level
+            e->_evpad = 0;
             bpf_ringbuf_submit(e, 0);
         }
     }
@@ -153,6 +226,71 @@ int syntriass_policy_lookup_bench(struct bpf_sock_addr *ctx) {
     struct syntriass_policy *pol = bpf_map_lookup_elem(&policy_table, &cgid);
     if (!pol) return 0; // map miss => fail closed
     if (pol->expiry_ns != 0 && bpf_ktime_get_ns() > pol->expiry_ns) return 0; // expired
+    return (pol->posture == MODE_FAIL_CLOSED) ? 0 : 1;
+}
+
+// Phase 2: hierarchical enforcement. Resolves the effective policy across
+// Global/Node/Application/Session (highest priority wins, more-specific breaks
+// ties), then applies the same fail-closed decision rules as Phase 1. Emits a
+// structured audit record carrying the winning level.
+SEC("cgroup/connect4")
+int syntriass_policy_hier(struct bpf_sock_addr *ctx) {
+    __u64 cgid = bpf_get_current_cgroup_id();
+    __u16 dport = bpf_ntohs(ctx->user_port);
+    __u64 flowkey = ((__u64)ctx->user_ip4 << 16) | dport;
+
+    __u32 level = LEVEL_GLOBAL;
+    struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
+
+    __u32 posture;
+    __u16 reason;
+    __u64 policy_id = 0;
+    if (!pol) {
+        posture = MODE_FAIL_CLOSED;
+        reason = REASON_NO_POLICY; // no applicable policy at any level
+    } else {
+        posture = pol->posture;
+        reason = (posture == MODE_FAIL_CLOSED) ? REASON_FAILCLOSED : REASON_OK;
+        policy_id = pol->policy_id;
+    }
+    __u16 decision = (posture == MODE_FAIL_CLOSED) ? 1 : 0;
+
+    if (decision == 0) {
+        __u8 st = (__u8)(posture + 1);
+        bpf_map_update_elem(&session_state, &flowkey, &st, BPF_ANY);
+    }
+
+    __u8 audit = pol ? pol->audit_enabled : 1;
+    if (audit) {
+        struct policy_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+        if (e) {
+            __u64 id = bpf_get_current_pid_tgid();
+            e->policy_id = policy_id;
+            e->cgroup_id = cgid;
+            e->pid = id >> 32;
+            e->daddr = ctx->user_ip4;
+            e->dport = dport;
+            e->posture = (__u16)posture;
+            e->decision = decision;
+            e->reason = reason;
+            e->level = level;
+            e->_evpad = 0;
+            bpf_ringbuf_submit(e, 0);
+        }
+    }
+    return decision ? 0 : 1;
+}
+
+// Lookup-only hierarchical variant: full 4-level resolution + decision, NO audit
+// and NO session marking, to isolate the inheritance-resolution cost.
+SEC("cgroup/connect4")
+int syntriass_policy_hier_bench(struct bpf_sock_addr *ctx) {
+    __u64 cgid = bpf_get_current_cgroup_id();
+    __u16 dport = bpf_ntohs(ctx->user_port);
+    __u64 flowkey = ((__u64)ctx->user_ip4 << 16) | dport;
+    __u32 level = LEVEL_GLOBAL;
+    struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
+    if (!pol) return 0;
     return (pol->posture == MODE_FAIL_CLOSED) ? 0 : 1;
 }
 
