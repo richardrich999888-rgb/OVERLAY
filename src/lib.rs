@@ -33,6 +33,7 @@ pub mod kernel_native;
 pub mod keystore;
 pub mod kinetic;
 pub mod over_socket;
+pub mod profiles;
 pub mod telemetry;
 
 /// Starts the Linux configuration hot-reload worker.

@@ -575,6 +575,105 @@ static int run_audit(int argc, char **argv) {
     return 0;
 }
 
+// ---- deployable defence profiles (Phase 6) ----
+// Concrete kernel settings per profile (mirrors src/profiles.rs):
+//   strategic : posture FullPqc, crypto 0x1B (FULL_PQC_ONLY|HYBRID_ONLY|HW_KEY|NO_CLASSICAL), prio 1000
+//   tactical  : posture FullPqc, crypto 0x16 (HYBRID_ONLY|FALLBACK_ALLOWED|NO_CLASSICAL),     prio 500
+//   legacy    : posture FullPqc, crypto 0x06 (HYBRID_ONLY|FALLBACK_ALLOWED),                  prio 100
+static int profile_of(const char *name, unsigned *posture, unsigned *crypto, unsigned *prio) {
+    if (strcmp(name, "strategic") == 0) { *posture = 0; *crypto = 0x1B; *prio = 1000; return 1; }
+    if (strcmp(name, "tactical") == 0)  { *posture = 0; *crypto = 0x16; *prio = 500;  return 1; }
+    if (strcmp(name, "legacy") == 0)    { *posture = 0; *crypto = 0x06; *prio = 100;  return 1; }
+    return 0;
+}
+
+// Apply a named profile to the GLOBAL level and hold; the script connects to
+// observe enforcement. degraded=1 installs the EncryptedFallback posture (the
+// degradation scenario) with the profile's crypto_flags, proving Strategic fails
+// closed while Tactical/Legacy keep the (encrypted) link up.
+//   profile <attach> <probe> <sport> <run_ms> <name> <degraded>
+static int run_profile(int argc, char **argv) {
+    if (argc < 8) { fprintf(stderr, "usage: profile <attach> <probe> <sport> <run_ms> <name> <degraded>\n"); return 1; }
+    const char *cg = argv[2];
+    int run_ms = atoi(argv[5]);
+    const char *name = argv[6];
+    int degraded = atoi(argv[7]);
+    unsigned posture, crypto, prio;
+    if (!profile_of(name, &posture, &crypto, &prio)) { fprintf(stderr, "unknown profile %s\n", name); return 1; }
+    if (degraded) posture = 1; // EncryptedFallback
+
+    struct bpf_object *obj = bpf_object__open_file("policy_v2.bpf.o", NULL);
+    if (!obj || bpf_object__load(obj)) { fprintf(stderr, "profile load fail\n"); return 2; }
+    int ev_fd = bpf_object__find_map_fd_by_name(obj, "events");
+    int g_fd = bpf_object__find_map_fd_by_name(obj, "global_policy");
+    struct bpf_program *p = bpf_object__find_program_by_name(obj, "syntriass_policy_hier");
+    int cgfd = open(cg, O_RDONLY | O_DIRECTORY);
+    if (cgfd < 0) { perror("open cgroup"); return 3; }
+    struct bpf_link *link = bpf_program__attach_cgroup(p, cgfd);
+    if (!link) { fprintf(stderr, "profile attach fail\n"); return 4; }
+    struct ring_buffer *rb = ring_buffer__new(ev_fd, on_event, NULL, NULL);
+
+    unsigned int z = 0;
+    long t = now_us();
+    push_to(g_fd, &z, posture, prio, 0xB0F00 + prio, 0, crypto);
+    long apply_us = now_us() - t;
+    printf("PROFILE name=%s degraded=%d posture=%u crypto=0x%02x prio=%u apply_us=%ld\n",
+           name, degraded, posture, crypto, prio, apply_us);
+    fflush(stdout);
+    fprintf(stderr, "READY\n"); fflush(stderr);
+
+    long start = now_ms();
+    while (now_ms() < start + run_ms) ring_buffer__poll(rb, 50);
+    ring_buffer__free(rb);
+    bpf_link__destroy(link);
+    close(cgfd);
+    bpf_object__close(obj);
+    return 0;
+}
+
+// Measure profile application and switch latency: apply strategic, then switch
+// strategic->tactical->legacy->... repeatedly, timing each global re-push.
+//   profileswitch <attach> <probe> <sport> <iters>
+static int run_profileswitch(int argc, char **argv) {
+    if (argc < 6) { fprintf(stderr, "usage: profileswitch <attach> <probe> <sport> <iters>\n"); return 1; }
+    const char *cg = argv[2];
+    int iters = atoi(argv[5]);
+
+    struct bpf_object *obj = bpf_object__open_file("policy_v2.bpf.o", NULL);
+    if (!obj || bpf_object__load(obj)) { fprintf(stderr, "switch load fail\n"); return 2; }
+    int g_fd = bpf_object__find_map_fd_by_name(obj, "global_policy");
+    struct bpf_program *p = bpf_object__find_program_by_name(obj, "syntriass_policy_hier");
+    int cgfd = open(cg, O_RDONLY | O_DIRECTORY);
+    if (cgfd < 0) { perror("open cgroup"); return 3; }
+    struct bpf_link *link = bpf_program__attach_cgroup(p, cgfd);
+    if (!link) { fprintf(stderr, "switch attach fail\n"); return 4; }
+
+    const char *names[3] = {"strategic", "tactical", "legacy"};
+    unsigned int z = 0;
+    // initial application
+    unsigned po, cr, pr; profile_of(names[0], &po, &cr, &pr);
+    long t0 = now_us();
+    push_to(g_fd, &z, po, pr, 0xB0F00 + pr, 0, cr);
+    long apply_us = now_us() - t0;
+
+    long sum = 0, mx = 0;
+    for (int i = 1; i <= iters; i++) {
+        const char *nm = names[i % 3];
+        profile_of(nm, &po, &cr, &pr);
+        long t = now_us();
+        push_to(g_fd, &z, po, pr, 0xB0F00 + pr, 0, cr);
+        long us = now_us() - t;
+        sum += us; if (us > mx) mx = us;
+    }
+    printf("PROFILESWITCH apply_us=%ld switches=%d avg_switch_us=%.2f max_switch_us=%ld\n",
+           apply_us, iters, (double)sum / (double)iters, mx);
+    fflush(stdout);
+    bpf_link__destroy(link);
+    close(cgfd);
+    bpf_object__close(obj);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "bench") == 0) return run_bench(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "hier") == 0) return run_hier(argc, argv);
@@ -582,6 +681,8 @@ int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "quar") == 0) return run_quar(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "quarbench") == 0) return run_quarbench(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "audit") == 0) return run_audit(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "profile") == 0) return run_profile(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "profileswitch") == 0) return run_profileswitch(argc, argv);
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s <attach-cgroup> <run_ms> <schedule> <probe-cgroup> [expired-cgroup]\n",
