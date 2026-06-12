@@ -22,4 +22,13 @@ llvm-strip -g connect4.bpf.o
 echo "== compiling loader.c (libbpf) =="
 clang -O2 -Wall loader.c -o loader -lbpf -lelf -lz
 
-echo "OK: connect4.bpf.o + loader built"
+echo "== compiling policy.bpf.c (clang -target bpf) =="
+clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 \
+    ${ARCH_INC:+-idirafter "$ARCH_INC"} \
+    -c policy.bpf.c -o policy.bpf.o
+llvm-strip -g policy.bpf.o
+
+echo "== compiling policy_loader.c (libbpf) =="
+clang -O2 -Wall policy_loader.c -o policy_loader -lbpf -lelf -lz
+
+echo "OK: connect4.bpf.o + loader + policy.bpf.o + policy_loader built"

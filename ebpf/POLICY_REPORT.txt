@@ -1,0 +1,17 @@
+================ eBPF POLICY/STATE LAYER (measured) ================
+---- posture distribution (map update latency) ----
+  UPD mode=0 us=3
+  UPD mode=0 us=1
+  UPD mode=2 us=90
+---- enforcement decisions (from the kernel ring buffer) ----
+  EVT pid=9328 dst=127.0.0.1:51111 mode=0 decision=ALLOW
+  EVT pid=9331 dst=127.0.0.1:51222 mode=2 decision=DENY
+---- session_state entries distributed kernel->userspace ----
+  live sessions: 1
+
+FullPqc connect result : MX rc=-1 errno=111(Connection refused)
+FailClosed connect result: MX rc=-1 errno=1(Operation not permitted)
+  [OK] FullPqc -> ALLOWED (reached network, connection refused)
+  [OK] FailClosed -> DENIED (EPERM): fail-closed transition enforced by map state
+
+RESULT: PASS — kernel enforces live posture from map state; fail-closed transition works.

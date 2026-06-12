@@ -18,3 +18,5 @@ benchmarks/mininet_local_range/raw_logs.txt
 # eBPF build artifacts (host-built; sources are committed)
 /ebpf/c/connect4.bpf.o
 /ebpf/c/loader
+/ebpf/c/policy.bpf.o
+/ebpf/c/policy_loader
