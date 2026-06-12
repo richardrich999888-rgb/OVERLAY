@@ -54,10 +54,15 @@ struct syntriass_policy {
 };
 
 struct policy_event {
-    unsigned long long policy_id, cgroup_id;
+    unsigned long long policy_id, cgroup_id, ktime_ns;
     unsigned int pid, daddr;
     unsigned short dport, posture, decision, reason;
-    unsigned int level, _evpad;
+    unsigned int level;
+    unsigned short event_type, _evpad;
+};
+
+struct audit_stats {
+    unsigned long long emitted, dropped;
 };
 
 struct quarantine_entry {
@@ -467,12 +472,116 @@ static int run_quarbench(int argc, char **argv) {
     return 0;
 }
 
+// ---- audit/telemetry measurement (Phase 5) ----
+static unsigned long long g_recv = 0, g_lat_sum = 0, g_lat_max = 0;
+static unsigned long long g_t_first = 0, g_t_last = 0; // active-window bounds
+static long *g_lat_samples = NULL;
+static unsigned long g_lat_n = 0, g_lat_cap = 0;
+static int cmp_long(const void *a, const void *b) {
+    long x = *(const long *)a, y = *(const long *)b;
+    return (x > y) - (x < y);
+}
+static int on_audit(void *c, void *data, size_t sz) {
+    (void)c;
+    if (sz < sizeof(struct policy_event)) return 0;
+    struct policy_event *e = data;
+    unsigned long long now = now_ns();
+    unsigned long long lat = now - e->ktime_ns; // kernel emit -> userspace recv
+    if (g_t_first == 0) g_t_first = now;
+    g_t_last = now;
+    g_recv++;
+    g_lat_sum += lat;
+    if (lat > g_lat_max) g_lat_max = lat;
+    if (g_lat_n < g_lat_cap) g_lat_samples[g_lat_n++] = (long)lat;
+    return 0;
+}
+
+// Measure audit event latency, throughput, and dropped-event rate.
+//   audit <attach> <probe> <sport> <run_ms> <nowakeup:0|1> <drain_delay_us>
+static int run_audit(int argc, char **argv) {
+    if (argc < 8) { fprintf(stderr, "usage: audit <attach> <probe> <sport> <run_ms> <nowakeup> <drain_us>\n"); return 1; }
+    const char *cg = argv[2];
+    unsigned long long probe_cgid = cgid_of(argv[3]);
+    int run_ms = atoi(argv[5]);
+    int nowakeup = atoi(argv[6]);
+    int drain_us = atoi(argv[7]);
+
+    struct bpf_object *obj = bpf_object__open_file("policy_v2.bpf.o", NULL);
+    if (!obj || bpf_object__load(obj)) { fprintf(stderr, "audit load fail\n"); return 2; }
+    g_pol_fd = bpf_object__find_map_fd_by_name(obj, "policy_table");
+    int ev_fd = bpf_object__find_map_fd_by_name(obj, "events");
+    int cfg_fd = bpf_object__find_map_fd_by_name(obj, "audit_cfg");
+    int stats_fd = bpf_object__find_map_fd_by_name(obj, "audit_stats_map");
+    struct bpf_program *p = bpf_object__find_program_by_name(obj, "syntriass_policy_hier");
+    int cgfd = open(cg, O_RDONLY | O_DIRECTORY);
+    if (cgfd < 0) { perror("open cgroup"); return 3; }
+    struct bpf_link *link = bpf_program__attach_cgroup(p, cgfd);
+    if (!link) { fprintf(stderr, "audit attach fail\n"); return 4; }
+    struct ring_buffer *rb = ring_buffer__new(ev_fd, on_audit, NULL, NULL);
+
+    // wakeup policy: 0 = adaptive; 2 = BPF_RB_NO_WAKEUP (poll-driven).
+    unsigned int z = 0;
+    unsigned long long flags = nowakeup ? 2ULL : 0ULL;
+    bpf_map_update_elem(cfg_fd, &z, &flags, BPF_ANY);
+
+    push_policy_ex(probe_cgid, MODE_FULL_PQC, 0xA0D17, 0); // allow path -> EV_DECISION
+
+    g_lat_cap = 300000;
+    g_lat_samples = calloc(g_lat_cap, sizeof(long));
+    printf("AUDITCFG nowakeup=%d drain_us=%d\n", nowakeup, drain_us);
+    fprintf(stderr, "READY\n"); fflush(stderr);
+
+    long start = now_ms();
+    // drain_us > 0 is a ONE-TIME consumer stall at the start of the run: while the
+    // consumer is stalled the burst overflows the ring buffer, forcing (and
+    // counting) real drops. After the stall the consumer drains normally.
+    if (drain_us > 0) usleep(drain_us);
+    while (now_ms() < start + run_ms) ring_buffer__poll(rb, 10);
+    // final drain
+    for (int i = 0; i < 200; i++) ring_buffer__poll(rb, 5);
+    // throughput is measured over the ACTIVE window (first -> last event), not the
+    // whole run (which includes idle time waiting for the burst).
+    double active_s = (g_t_last > g_t_first) ? (double)(g_t_last - g_t_first) / 1e9 : 0;
+
+    // sum the per-CPU audit counters
+    int ncpu = libbpf_num_possible_cpus();
+    if (ncpu < 1) ncpu = 1;
+    struct audit_stats *vals = calloc(ncpu, sizeof(*vals));
+    unsigned long long emitted = 0, dropped = 0;
+    if (bpf_map_lookup_elem(stats_fd, &z, vals) == 0) {
+        for (int i = 0; i < ncpu; i++) { emitted += vals[i].emitted; dropped += vals[i].dropped; }
+    }
+    free(vals);
+
+    double avg = g_recv ? (double)g_lat_sum / (double)g_recv : 0;
+    long p99 = 0;
+    if (g_lat_n) {
+        qsort(g_lat_samples, g_lat_n, sizeof(long), cmp_long);
+        p99 = g_lat_samples[(unsigned long)(g_lat_n * 99 / 100)];
+    }
+    double drop_rate = (emitted + dropped) ? (double)dropped / (double)(emitted + dropped) : 0;
+    double thrpt = active_s > 0 ? (double)g_recv / active_s : 0;
+
+    printf("AUDITLAT recv=%llu emitted=%llu dropped=%llu drop_rate=%.4f%%\n",
+           g_recv, emitted, dropped, drop_rate * 100.0);
+    printf("AUDITLAT event_latency_avg_ns=%.0f p99_ns=%ld max_ns=%llu\n", avg, p99, g_lat_max);
+    printf("AUDITLAT consume_throughput_eps=%.0f over_active=%.3fs\n", thrpt, active_s);
+    fflush(stdout);
+    free(g_lat_samples);
+    ring_buffer__free(rb);
+    bpf_link__destroy(link);
+    close(cgfd);
+    bpf_object__close(obj);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "bench") == 0) return run_bench(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "hier") == 0) return run_hier(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "hierbench") == 0) return run_hierbench(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "quar") == 0) return run_quar(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "quarbench") == 0) return run_quarbench(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "audit") == 0) return run_audit(argc, argv);
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s <attach-cgroup> <run_ms> <schedule> <probe-cgroup> [expired-cgroup]\n",

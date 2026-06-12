@@ -77,18 +77,33 @@ struct syntriass_policy {
 #define LEVEL_APP 2u
 #define LEVEL_SESSION 3u
 
+// Audit event categories (Phase 5).
+#define EV_DECISION 0u   // a normal allow/deny from posture
+#define EV_VIOLATION 1u  // a crypto-policy rejection
+#define EV_FALLBACK 2u   // an EncryptedFallback connection was allowed
+#define EV_QUARANTINE 3u // a quarantine deny
+
 // A structured audit/decision record (kernel -> userspace).
 struct policy_event {
     __u64 policy_id;
     __u64 cgroup_id;
+    __u64 ktime_ns; // kernel emit timestamp (CLOCK_MONOTONIC ns) for event latency
     __u32 pid;
     __u32 daddr;
     __u16 dport;
     __u16 posture;
-    __u16 decision; // 0=allow 1=deny
-    __u16 reason;   // REASON_*
-    __u32 level;    // resolved level (LEVEL_*) that won the decision
-    __u32 _evpad;
+    __u16 decision;    // 0=allow 1=deny
+    __u16 reason;      // REASON_*
+    __u32 level;       // resolved level (LEVEL_*) that won the decision
+    __u16 event_type;  // EV_*
+    __u16 _evpad;
+};
+
+// Per-CPU audit counters (summed in userspace) — emitted vs dropped (a dropped
+// event is a ring-buffer reservation failure: the consumer fell behind).
+struct audit_stats {
+    __u64 emitted;
+    __u64 dropped;
 };
 
 struct {
@@ -109,6 +124,63 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 22);
 } events SEC(".maps");
+
+// Phase 5: audit counters + wakeup-policy config.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct audit_stats);
+} audit_stats_map SEC(".maps");
+
+// audit_cfg[0] = ring-buffer submit flags. 0 = adaptive wakeup (default);
+// set BPF_RB_NO_WAKEUP (2) to suppress per-event consumer wakeups (the consumer
+// polls instead) — this removes the per-connect wakeup cost measured in Phase 1.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} audit_cfg SEC(".maps");
+
+// Emit one structured audit record, counting emitted/dropped per CPU and honoring
+// the configured ring-buffer wakeup policy.
+static __always_inline void emit_event(struct bpf_sock_addr *ctx, __u64 cgid,
+                                       __u64 policy_id, __u16 posture, __u16 decision,
+                                       __u16 reason, __u32 level, __u16 etype) {
+    __u32 z = 0;
+    struct audit_stats *st = bpf_map_lookup_elem(&audit_stats_map, &z);
+    struct policy_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        if (st) st->dropped += 1; // reservation failed: consumer fell behind
+        return;
+    }
+    __u64 id = bpf_get_current_pid_tgid();
+    e->policy_id = policy_id;
+    e->cgroup_id = cgid;
+    e->ktime_ns = bpf_ktime_get_ns();
+    e->pid = id >> 32;
+    e->daddr = ctx->user_ip4;
+    e->dport = bpf_ntohs(ctx->user_port);
+    e->posture = posture;
+    e->decision = decision;
+    e->reason = reason;
+    e->level = level;
+    e->event_type = etype;
+    e->_evpad = 0;
+    __u64 *flags = bpf_map_lookup_elem(&audit_cfg, &z);
+    __u64 fl = flags ? *flags : 0;
+    bpf_ringbuf_submit(e, fl);
+    if (st) st->emitted += 1;
+}
+
+// Classify a decision into an audit category.
+static __always_inline __u16 event_category(__u16 decision, __u16 reason, __u32 posture) {
+    if (reason == REASON_QUARANTINE) return EV_QUARANTINE;
+    if (reason == REASON_CRYPTO) return EV_VIOLATION;
+    if (decision == 0 && posture == MODE_ENCRYPTED_FALLBACK) return EV_FALLBACK;
+    return EV_DECISION;
+}
 
 // Hierarchy levels (Phase 2). policy_table above is the Application level (keyed
 // by cgroup id). Global and Node are singletons; Session is keyed by flow tuple.
@@ -238,21 +310,8 @@ int syntriass_policy_v2(struct bpf_sock_addr *ctx) {
     }
 
     if (audit) {
-        struct policy_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-        if (e) {
-            __u64 id = bpf_get_current_pid_tgid();
-            e->policy_id = policy_id;
-            e->cgroup_id = cgid;
-            e->pid = id >> 32;
-            e->daddr = ctx->user_ip4;
-            e->dport = dport;
-            e->posture = (__u16)posture;
-            e->decision = decision;
-            e->reason = reason;
-            e->level = LEVEL_APP; // Phase-1 program keys on the cgroup/app level
-            e->_evpad = 0;
-            bpf_ringbuf_submit(e, 0);
-        }
+        __u16 etype = event_category(decision, reason, posture);
+        emit_event(ctx, cgid, policy_id, (__u16)posture, decision, reason, LEVEL_APP, etype);
     }
 
     return decision ? 0 : 1; // 0 = deny, 1 = allow
@@ -290,21 +349,8 @@ int syntriass_policy_hier(struct bpf_sock_addr *ctx) {
 
     // Quarantine is the highest-priority deny — it overrides every policy level.
     if (syntriass_quarantined(cgid)) {
-        struct policy_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-        if (e) {
-            __u64 id = bpf_get_current_pid_tgid();
-            e->policy_id = 0;
-            e->cgroup_id = cgid;
-            e->pid = id >> 32;
-            e->daddr = ctx->user_ip4;
-            e->dport = dport;
-            e->posture = MODE_FAIL_CLOSED;
-            e->decision = 1;
-            e->reason = REASON_QUARANTINE;
-            e->level = level;
-            e->_evpad = 0;
-            bpf_ringbuf_submit(e, 0);
-        }
+        emit_event(ctx, cgid, 0, MODE_FAIL_CLOSED, 1, REASON_QUARANTINE, level,
+                   EV_QUARANTINE);
         return 0; // deny (EPERM)
     }
 
@@ -341,21 +387,8 @@ int syntriass_policy_hier(struct bpf_sock_addr *ctx) {
 
     __u8 audit = pol ? pol->audit_enabled : 1;
     if (audit) {
-        struct policy_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-        if (e) {
-            __u64 id = bpf_get_current_pid_tgid();
-            e->policy_id = policy_id;
-            e->cgroup_id = cgid;
-            e->pid = id >> 32;
-            e->daddr = ctx->user_ip4;
-            e->dport = dport;
-            e->posture = (__u16)posture;
-            e->decision = decision;
-            e->reason = reason;
-            e->level = level;
-            e->_evpad = 0;
-            bpf_ringbuf_submit(e, 0);
-        }
+        __u16 etype = event_category(decision, reason, posture);
+        emit_event(ctx, cgid, policy_id, (__u16)posture, decision, reason, level, etype);
     }
     return decision ? 0 : 1;
 }
