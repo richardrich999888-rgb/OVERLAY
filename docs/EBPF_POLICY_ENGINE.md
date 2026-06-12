@@ -75,3 +75,27 @@ Map updates, policy enforcement, and the fail-closed transition are all
 - **Boundary [design]**: runs on a BPF-capable host (root/CAP_BPF), not the
   default CI sandbox; a privileged BPF CI lane should run
   `scripts/ebpf_policy_validate.sh` per-PR.
+
+## 5. Migration Platform Phase 3 — re-validation & map inventory
+
+The mission's three named maps map directly onto this engine, all
+**userspace-synchronised** and **[measured]** on kernel 6.18.5 (re-run via
+`scripts/ebpf_policy_validate.sh`):
+
+| Mission map | This engine | Direction | Measured |
+|---|---|---|---|
+| **Posture map** | `operation_mode` ARRAY[1] u32 (0/1/2) | userspace → kernel | update **1–4 µs** (156 µs cold), FullPqc→ALLOW, FailClosed→DENY (EPERM) |
+| **Fallback map** | `fallback_state` ARRAY[1] u32 | userspace → kernel | read on the decision path |
+| **Session map** | `session_state` HASH<flow,u8> | kernel → userspace | live session recorded (`live sessions: 1`) |
+| events | `events` RINGBUF | kernel → userspace | one structured record per decision |
+
+The **production v2 engine** (`ebpf/c/policy_v2.bpf.c`, six phases) extends this
+into structured policy objects, a 4-level hierarchy, crypto enforcement,
+quarantine, an audit pipeline, and deployable profiles — each separately measured
+in `docs/POLICY_OBJECT_MODEL.md`, `HIERARCHICAL_POLICY.md`, `CRYPTO_POLICY.md`,
+`QUARANTINE_ENGINE.md`, `AUDIT_TELEMETRY.md`, `DEFENCE_POLICY_PROFILES.md`.
+
+**Phase-3 success criteria:** kernel receives live policy state ✅ [measured];
+enforcement uses kernel maps ✅ [measured] (decision read from map state on every
+`connect`); no plaintext leakage ✅ [tested] (FailClosed → EPERM; no posture
+encodes plaintext). Residual daemon-loop wiring remains [design] (above).
