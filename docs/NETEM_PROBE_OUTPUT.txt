@@ -1,0 +1,27 @@
+==== tc netem capability probe ====
+RESULT: REAL tc netem is NOT AVAILABLE on this host.
+  reason : Error: Specified qdisc kind is unknown.
+  kernel : 6.18.5
+  qdiscs : netem=NO tbf=NO prio=NO htb=NO 
+  sched module dir: absent (qdiscs would need to be built-in)
+
+  HOST-SIDE VALIDATION PLAN (run on a netem-capable Linux host):
+    for L in 10 20 30 45; do
+      ip netns add A; ip netns add B
+      ip link add vA type veth peer name vB
+      ip link set vA netns A; ip link set vB netns B
+      ip -n A addr add 10.9.0.1/24 dev vA; ip -n A link set vA up; ip -n A link set lo up
+      ip -n B addr add 10.9.0.2/24 dev vB; ip -n B link set vB up; ip -n B link set lo up
+      # apply netem on BOTH directions (loss + jitter + reorder)
+      ip netns exec A tc qdisc add dev vA root netem loss ${L}% delay 40ms 15ms reorder 25% 50%
+      ip netns exec B tc qdisc add dev vB root netem loss ${L}% delay 40ms 15ms reorder 25% 50%
+      ip netns exec A ping -c 200 -i 0.01 10.9.0.2 | tail -3      # confirm loss% + rtt
+      # drive the REAL daemon across the impaired link:
+      #   B: SYNTRIASS_OVERSOCKET_LISTEN=10.9.0.2:8443 <identity env> daemon &
+      #   A: client connects to 10.9.0.2:8443 -> record handshake success-rate/latency
+      ip netns del A; ip netns del B
+    done
+  The metrics the userspace counterpart already measures
+  (tests/battlefield_resilience.rs) would then be [measured: kernel netem]
+  rather than [measured: userspace model]. Re-run THIS script there to populate
+  docs/NETEM_RESULTS.md with the real ladder.

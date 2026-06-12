@@ -31,7 +31,8 @@ yet backed by committed evidence.
 | **IL-1** | No identity lifecycle: peer keys statically pinned, never enrolled/rotated/revoked/expired | High → **Low** | **Mitigated: hybrid-PQC credential lifecycle — enrollment+PoP, issuance, scheduled & emergency rotation, renewal, CRL revocation with monotonic propagation, expiry, lost-key/compromised-node recovery, and offline/air-gap provisioning — 28 tests + benchmarks, shown driving the real handshake; TPM2/PKCS#11/HSM evaluated as design with infra plan** | `docs/IDENTITY_LIFECYCLE.md`, `docs/OFFLINE_PROVISIONING.md`; `src/identity.rs`; `tests/identity_lifecycle_tests.rs`; `benches/identity_benchmarks.rs` |
 | **C1** | LD_PRELOAD interception is incomplete (static/Go/musl/direct-syscall bypass it) | High → **Low** | **Replaced with a kernel `cgroup/connect4` eBPF data plane, built+loaded+attached+measured: 7/7 runtimes intercepted incl. the 4 LD_PRELOAD blind spots; fail-closed deny enforced (EPERM)** | `docs/UNIVERSAL_INTERCEPTION.md`; `ebpf/c/`, `ebpf/COVERAGE_REPORT.txt`; `scripts/ebpf_coverage_validate.sh` |
 | **KS-1** | File-based key storage: raw seeds on disk, no hardware protection | High → **Low–Medium** | **Backend-agnostic key-protection layer: software (AES-GCM) + TPM2 + PKCS#11/HSM. Software fully tested; TPM (swtpm) and PKCS#11 (SoftHSM2) backends validated end-to-end through the real Rust adapter against software substitutes — incl. sealed-to-hardware (a different TPM can't unseal). Physical-device acceptance = design** | `docs/KEY_STORAGE_ARCHITECTURE.md`, `docs/TPM_INTEGRATION.md`, `docs/HSM_INTEGRATION.md`; `src/keystore.rs`; `tests/keystore_external_tests.rs`; `scripts/keystore/` |
-| C2–C5, C7 | Resilience (`tc netem`), sovereign/ARM, et al. | — | **Open / tracked** | host-only / future increments (see §4) |
+| **C2** | Resilience under degraded network unproven | Med → **Low–Medium** | **Measured: loss ladder 10/20/30/45% (record channel — delivery/goodput/latency/replay, 0 plaintext leaks), handshake success-rate floor, reconnect ~3.5ms, CPU-starvation 30/30, congestion 249 hs/s, daemon-crash + mem-exhaustion fail-closed. Real `tc netem` UNAVAILABLE here (no qdisc layer) — documented + host-side plan** | `docs/BATTLEFIELD_RESILIENCE.md`, `docs/NETEM_RESULTS.md`, `docs/RECOVERY_ANALYSIS.md`; `tests/battlefield_resilience.rs`, `tests/chaos_orchestration.rs`; `scripts/netem_validate.sh` |
+| C3–C5, C7 | Sovereign/ARM hardware, et al. | — | **Open / tracked** | host-only / future increments (see §4) |
 
 > The original review's full C-series text was a chat-only artifact. Rather than
 > restate findings whose details are not yet backed by committed evidence, this
@@ -242,6 +243,17 @@ lane* to run Miri/Loom/fuzz per-PR (R2), not an unaddressed code weakness.
    (sealed-to-hardware). Physical-device acceptance is `[design]`.
    `docs/KEY_STORAGE_ARCHITECTURE.md`, `docs/TPM_INTEGRATION.md`, `docs/HSM_INTEGRATION.md`.
 
+7. **Battlefield resilience (C2).** Measured behaviour under degraded conditions:
+   the loss ladder (10/20/30/45 %) over the real record channel (delivery/goodput/
+   latency/replay-rejection, **0 plaintext leaks**), handshake success-rate floor,
+   reconnect ~3.5 ms with fail-closed drop handling, CPU-starvation (30/30
+   complete), congestion (249 hs/s), and daemon-crash + memory-exhaustion
+   fail-closed (against the spawned daemon). **Real `tc netem` is unavailable in
+   this environment** (the kernel has no traffic-control qdisc layer) — documented
+   precisely with a runnable host-side plan (`scripts/netem_validate.sh`); the
+   impairment here is a userspace model over the real bytes, tagged as such.
+   `docs/BATTLEFIELD_RESILIENCE.md`, `docs/NETEM_RESULTS.md`, `docs/RECOVERY_ANALYSIS.md`.
+
 The Rust crate is pure-Rust and adds no packages to the main dependency tree; the
 eBPF data plane is out-of-tree C+libbpf (built by clang, not part of `cargo build`).
 
@@ -258,8 +270,10 @@ not be read as validated:
   longer on this list for the host case). Still **[design]**: per-pod K8s attach,
   `connect6` (IPv6), `sendmsg4` (UDP), and a privileged BPF CI lane
   (`docs/UNIVERSAL_INTERCEPTION.md §5`).
-- **`tc netem` 10/20/30/45% loss** at the kernel qdisc level (the record-layer
-  loss numbers above use an in-process model, clearly labelled as such).
+- **Kernel `tc netem`** at the qdisc level: this environment has **no qdisc layer
+  at all** (verified — `scripts/netem_validate.sh`), so the resilience loss ladder
+  (C2) uses a userspace impairment model over the real bytes, clearly tagged; the
+  host-side netem plan is in `docs/NETEM_RESULTS.md`.
 - **Sovereign ARM64** hardware validation.
 - **Hardware-backed key storage on a PHYSICAL device** (a real TPM chip / FIPS
   HSM). The TPM2 and PKCS#11 backends are **validated against software substitutes**
@@ -289,6 +303,8 @@ cargo test --test fail_closed_properties --test concurrency_stress \
 cargo test --lib identity --lib keystore --test identity_lifecycle_tests -- --nocapture
 sudo bash scripts/keystore/validate.sh        # TPM (swtpm) + PKCS#11 (SoftHSM2)
 cargo test --test chaos_orchestration     # spawns the real daemon binary
+cargo test --release --test battlefield_resilience -- --nocapture --test-threads=1
+bash scripts/netem_validate.sh            # real netem where available; else host-side plan
 # nightly (validated here): scripts/run_miri.sh ; cargo test --test loom_model --release ;
 #                           cargo +nightly fuzz run cookie_parse -- -max_total_time=60
 ```
