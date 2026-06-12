@@ -15,6 +15,7 @@ pub mod fallback;
 mod generic;
 pub mod nist1024;
 pub mod nist768;
+pub mod oob;
 pub mod session;
 
 pub use session::{

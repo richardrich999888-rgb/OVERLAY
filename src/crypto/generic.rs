@@ -20,6 +20,7 @@ use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Encoded, EncodedSizeUser, KemCore};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use subtle::ConstantTimeEq;
 use x25519_dalek::{EphemeralSecret, PublicKey as XPublicKey};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -416,6 +417,203 @@ pub fn finish<K: KemCore>(
     let th = transcript_hash(state.suite_id, &state.client_hello, body);
     let keys = derive(&ikm, state.suite_id, &th, true)?;
     Ok(keys)
+}
+
+// ----------------------- Out-of-band identity (compact runtime) -----------------------
+//
+// The full handshake above carries the peer's ML-DSA-65 public key (1952 B) and a
+// fresh ML-DSA-65 signature (3309 B) on EVERY handshake. The out-of-band variant
+// removes both from the runtime wire: the peer is referenced by a 32-byte
+// `IdentityKeyHash`, and authentication is a 32-byte HMAC capability under a
+// per-peer `auth_secret` that was established during PQ-authenticated provisioning
+// (the ML-DSA exchange happens once, off the runtime path). The KEM exchange
+// (X25519 + ML-KEM) — i.e. the confidentiality + forward secrecy — is unchanged.
+// Mutual authentication is preserved: each side proves possession of the shared
+// `auth_secret` over the transcript, with domain-separated client/server labels.
+
+const OOB_HASH_LEN: usize = 32;
+const OOB_TAG_LEN: usize = 32;
+const OOB_CLIENT_LABEL: &[u8] = b"syntriass-overlay oob client-auth v1";
+const OOB_SERVER_LABEL: &[u8] = b"syntriass-overlay oob server-auth v1";
+
+fn oob_tag(auth_secret: &[u8], label: &[u8], suite_id: u8, parts: &[&[u8]]) -> [u8; OOB_TAG_LEN] {
+    use hmac::{Hmac, Mac};
+    let mut m =
+        <Hmac<Sha256> as Mac>::new_from_slice(auth_secret).expect("HMAC accepts any key length");
+    m.update(label);
+    m.update(&[suite_id]);
+    for p in parts {
+        m.update(p);
+    }
+    let out = m.finalize().into_bytes();
+    let mut t = [0u8; OOB_TAG_LEN];
+    t.copy_from_slice(&out);
+    t
+}
+
+/// Retained initiator secrets for an out-of-band handshake.
+pub struct OobInitiatorState<K: KemCore> {
+    suite_id: u8,
+    x_secret: EphemeralSecret,
+    ml_decap: K::DecapsulationKey,
+    client_hello: Vec<u8>,
+}
+
+/// Out-of-band ClientHello. Body = `x_pub(32) || ML-KEM ek || own_hash(32) || tag(32)`.
+pub fn oob_client_hello<K: KemCore>(
+    suite_id: u8,
+    own_hash: &[u8; OOB_HASH_LEN],
+    auth_secret: &[u8],
+) -> Result<(OobInitiatorState<K>, Vec<u8>), CryptoError> {
+    let x_secret = EphemeralSecret::random();
+    let x_public = XPublicKey::from(&x_secret);
+    let mut rng = rand_core::OsRng;
+    let (ml_decap, ml_encap) = K::generate(&mut rng);
+    let ek = ml_encap.as_bytes();
+
+    let mut unsigned = Vec::with_capacity(X25519_LEN + ek.len() + OOB_HASH_LEN);
+    unsigned.extend_from_slice(x_public.as_bytes());
+    unsigned.extend_from_slice(ek.as_slice());
+    unsigned.extend_from_slice(own_hash);
+
+    let tag = oob_tag(auth_secret, OOB_CLIENT_LABEL, suite_id, &[&unsigned]);
+    let mut body = unsigned;
+    body.extend_from_slice(&tag);
+    Ok((
+        OobInitiatorState {
+            suite_id,
+            x_secret,
+            ml_decap,
+            client_hello: body.clone(),
+        },
+        body,
+    ))
+}
+
+/// Extract the peer's `IdentityKeyHash` from an out-of-band ClientHello so the
+/// responder can resolve the shared `auth_secret` from its registry before
+/// verifying the tag. Length-validated; returns `BadHelloLength` on a short body.
+pub fn oob_client_hash(body: &[u8], ek_len: usize) -> Result<[u8; OOB_HASH_LEN], CryptoError> {
+    let unsigned_len = X25519_LEN + ek_len + OOB_HASH_LEN;
+    if body.len() != unsigned_len + OOB_TAG_LEN {
+        return Err(CryptoError::BadHelloLength);
+    }
+    let h = &body[X25519_LEN + ek_len..unsigned_len];
+    let mut out = [0u8; OOB_HASH_LEN];
+    out.copy_from_slice(h);
+    Ok(out)
+}
+
+/// Out-of-band responder. Verifies the client tag under the (registry-resolved)
+/// shared `auth_secret`, encapsulates, and returns the established keys plus a
+/// ServerHello that carries `own_hash` and a server tag binding the full
+/// transcript. Body out = `x_pub(32) || ML-KEM ct || own_hash(32) || tag(32)`.
+pub fn oob_respond<K: KemCore>(
+    suite_id: u8,
+    ek_len: usize,
+    own_hash: &[u8; OOB_HASH_LEN],
+    auth_secret: &[u8],
+    body: &[u8],
+) -> Result<(SessionKeys, Vec<u8>), CryptoError> {
+    let unsigned_len = X25519_LEN + ek_len + OOB_HASH_LEN;
+    if body.len() != unsigned_len + OOB_TAG_LEN {
+        return Err(CryptoError::BadHelloLength);
+    }
+    let unsigned = &body[..unsigned_len];
+    let tag = &body[unsigned_len..];
+    let expect = oob_tag(auth_secret, OOB_CLIENT_LABEL, suite_id, &[unsigned]);
+    if !bool::from(expect[..].ct_eq(tag)) {
+        return Err(CryptoError::Authentication);
+    }
+
+    let peer_x_arr: [u8; 32] = body[0..X25519_LEN]
+        .try_into()
+        .map_err(|_| CryptoError::BadHelloLength)?;
+    let peer_x = XPublicKey::from(peer_x_arr);
+    let ek_slice = &body[X25519_LEN..X25519_LEN + ek_len];
+    let ek_enc =
+        Encoded::<K::EncapsulationKey>::try_from(ek_slice).map_err(|_| CryptoError::MlKemDecode)?;
+    let peer_ek = K::EncapsulationKey::from_bytes(&ek_enc);
+
+    let server_x_secret = EphemeralSecret::random();
+    let server_x_public = XPublicKey::from(&server_x_secret);
+    let mut rng = rand_core::OsRng;
+    let (ml_ct, ml_ss) = peer_ek
+        .encapsulate(&mut rng)
+        .map_err(|_| CryptoError::MlKemDecode)?;
+    let x_ss = server_x_secret.diffie_hellman(&peer_x);
+
+    let mut ikm = Zeroizing::new(Vec::with_capacity(32 + ml_ss.as_slice().len()));
+    ikm.extend_from_slice(x_ss.as_bytes());
+    ikm.extend_from_slice(ml_ss.as_slice());
+
+    let mut server_unsigned =
+        Vec::with_capacity(X25519_LEN + ml_ct.as_slice().len() + OOB_HASH_LEN);
+    server_unsigned.extend_from_slice(server_x_public.as_bytes());
+    server_unsigned.extend_from_slice(ml_ct.as_slice());
+    server_unsigned.extend_from_slice(own_hash);
+
+    // Server tag binds the client hello (channel binding) + the server unsigned.
+    let stag = oob_tag(
+        auth_secret,
+        OOB_SERVER_LABEL,
+        suite_id,
+        &[body, &server_unsigned],
+    );
+    let mut hello = server_unsigned;
+    hello.extend_from_slice(&stag);
+
+    let th = transcript_hash(suite_id, body, &hello);
+    let keys = derive(&ikm, suite_id, &th, false)?;
+    Ok((keys, hello))
+}
+
+/// Out-of-band initiator step 2. Verifies the server tag, confirms the responder
+/// is the expected peer (`expected_server_hash`), decapsulates, and derives keys.
+pub fn oob_finish<K: KemCore>(
+    state: OobInitiatorState<K>,
+    ct_len: usize,
+    expected_server_hash: &[u8; OOB_HASH_LEN],
+    auth_secret: &[u8],
+    body: &[u8],
+) -> Result<SessionKeys, CryptoError> {
+    let unsigned_len = X25519_LEN + ct_len + OOB_HASH_LEN;
+    if body.len() != unsigned_len + OOB_TAG_LEN {
+        return Err(CryptoError::BadHelloLength);
+    }
+    let server_unsigned = &body[..unsigned_len];
+    let stag = &body[unsigned_len..];
+    let server_hash = &body[X25519_LEN + ct_len..unsigned_len];
+    if !bool::from(server_hash.ct_eq(&expected_server_hash[..])) {
+        return Err(CryptoError::Authentication);
+    }
+    let expect = oob_tag(
+        auth_secret,
+        OOB_SERVER_LABEL,
+        state.suite_id,
+        &[&state.client_hello, server_unsigned],
+    );
+    if !bool::from(expect[..].ct_eq(stag)) {
+        return Err(CryptoError::Authentication);
+    }
+
+    let peer_x_arr: [u8; 32] = body[0..X25519_LEN]
+        .try_into()
+        .map_err(|_| CryptoError::BadHelloLength)?;
+    let peer_x = XPublicKey::from(peer_x_arr);
+    let ct_slice = &body[X25519_LEN..X25519_LEN + ct_len];
+    let ct = ml_kem::Ciphertext::<K>::try_from(ct_slice).map_err(|_| CryptoError::MlKemDecode)?;
+    let ml_ss = state
+        .ml_decap
+        .decapsulate(&ct)
+        .map_err(|_| CryptoError::Decapsulate)?;
+    let x_ss = state.x_secret.diffie_hellman(&peer_x);
+
+    let mut ikm = Zeroizing::new(Vec::with_capacity(32 + ml_ss.as_slice().len()));
+    ikm.extend_from_slice(x_ss.as_bytes());
+    ikm.extend_from_slice(ml_ss.as_slice());
+    let th = transcript_hash(state.suite_id, &state.client_hello, body);
+    derive(&ikm, state.suite_id, &th, true)
 }
 
 fn split_identity_fields(

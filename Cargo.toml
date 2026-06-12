@@ -19,6 +19,10 @@ harness = false
 name = "identity_benchmarks"
 harness = false
 
+[[bench]]
+name = "oob_benchmarks"
+harness = false
+
 [dependencies]
 # Raw FFI: dlsym/RTLD_NEXT, errno, fcntl, the real send/recv/connect. No SHA, no crypto here.
 libc = "=0.2.168"
