@@ -74,6 +74,42 @@ ML-DSA pubkey) per known peer — paid once at provisioning, not per handshake.
 | Expired peer ⇒ fail closed | `expired_peer_fails_closed` |
 | Peer lookup succeeds through the cache (hit/miss counters) | `cache_lookup_succeeds` |
 
+## 4a. Identity revocation — **[tested]** (Migration Platform Phase 1)
+
+The registry now carries an explicit **revocation set**, so a compromised or
+retired identity can be cut off without deleting its record (re-instatement
+stays an explicit operator action):
+
+| API (`src/crypto/oob.rs`) | Behaviour |
+|---|---|
+| `PeerRegistry::revoke(&hash)` | mark an identity revoked (idempotent; pre-emptive revocation of an unknown hash allowed) |
+| `PeerRegistry::unrevoke(&hash)` | lift a revocation; returns whether it was revoked |
+| `is_revoked(&hash)` / `revoked_count()` | query state |
+| `lookup(&hash)` | **fail-closed:** a revoked hash resolves to `None` (counted as a miss) — a revoked identity can neither initiate nor be responded to |
+| `provision(record)` | clears any prior revocation of that exact identity |
+
+Proven end-to-end by `revoked_identity_fails_closed_on_a_real_handshake`: a
+runtime OOB session round-trips, the server revokes the client, and the **very
+next real handshake fails closed** with `CryptoError::Authentication`; the
+initiator side can likewise revoke a peer so it no longer resolves.
+
+## 4b. SessionToken — **[tested]** typed rotating capability
+
+`SessionToken` is a 32-byte, epoch-bound authorization derived from the shared
+`auth_secret` (`HMAC(auth_secret, "…session-token v1" ‖ epoch)`):
+
+| Property | Test |
+|---|---|
+| both peers derive the **same** token for the same epoch | `session_token_agrees_across_peers_and_rotates_by_epoch` |
+| a new epoch rotates the token (no re-provisioning) | same |
+| comparison is **constant-time** (`SessionToken::verify`) | `subtle::ConstantTimeEq` |
+
+**Scope honesty:** `SessionToken` is [implemented]+[tested] as a typed rotating
+capability over the provisioned secret. It is **not yet carried on the runtime
+handshake wire** — the runtime handshake authenticates with the per-transcript
+HMAC capability in `generic::oob_*`. Binding `SessionToken` into that transcript
+(so token rotation gates live sessions) is **[design]** (R2 below).
+
 ## 5. Success criteria — status
 
 | Criterion | Status |
@@ -81,7 +117,19 @@ ML-DSA pubkey) per known peer — paid once at provisioning, not per handshake.
 | Runtime handshake no longer carries ML-DSA public keys | ✅ [tested] (`oob_handshake_carries_no_mldsa`) |
 | Runtime handshake no longer carries ML-DSA signatures | ✅ [tested] (size 2 464 B; no 3309-B field) |
 | Peer identity lookup succeeds through cache | ✅ [tested] (`cache_lookup_succeeds`) |
-| No plaintext fallback introduced | ✅ [tested] (all error paths return `Err`; no `Plaintext`) |
+| Identity revocation supported, fail-closed | ✅ [tested] (`revoked_identity_fails_closed_on_a_real_handshake`) |
+| SessionToken implemented | ✅ [implemented]+[tested]; runtime-wire binding [design] |
+| Mutual authentication preserved | ✅ [tested] (both sides prove the shared `auth_secret`) |
+| No plaintext fallback introduced | ✅ [tested] (all error paths `Err`; no `Plaintext`) |
+
+### Re-measured (Migration Platform Phase 1, this host)
+
+| Metric | Value |
+|---|---:|
+| Runtime handshake size | 13 050 → **2 464 B (−81.1 %)** [measured] |
+| Runtime handshake latency | **−81.6 %** vs full (this run 2 736 → 503 µs) [measured] |
+| ML-DSA bytes on the runtime wire | **0** (10 522 B/handshake removed) [measured] |
+| Revocation memory overhead | `HashSet<[u8;32]>`: **0 B empty**, 32 B/revoked-hash [implemented] |
 
 ## 6. Residual / boundary
 
@@ -89,6 +137,8 @@ ML-DSA pubkey) per known peer — paid once at provisioning, not per handshake.
   full one) on the runtime path, with the registry loaded from the credential
   lifecycle / sealed keystore, is a plumbing change — the primitives are
   implemented + tested; the daemon still calls the full handshake.
-- **R2 [design]** `auth_secret` rotation/expiry tie-in with the identity lifecycle
-  (revocation ⇒ drop the registry entry) is specified, not yet wired.
+- **R2 [design]** Binding `SessionToken` rotation into the runtime transcript, and
+  feeding the identity-lifecycle CRL into `PeerRegistry::revoke()` (CRL serial ⇒
+  registry revocation) — the revocation mechanism is implemented + tested; the
+  CRL→registry feed is the remaining wiring.
 - **R3** The OOB engine is suite-768; suite-1024 is the byte-symmetric extension.

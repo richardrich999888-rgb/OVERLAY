@@ -23,9 +23,10 @@
 //! MAC, so it is itself post-quantum secure). There is **no plaintext fallback** —
 //! an unknown hash, a bad tag, or an expired entry all fail closed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use ml_kem::MlKem768;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -55,6 +56,41 @@ impl IdentityKeyHash {
         h.update(mldsa65_pub);
         Self(h.finalize().into())
     }
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// A short-lived, epoch-bound session authorization token derived from the
+/// long-lived per-peer `auth_secret`. Both peers hold the same `auth_secret`, so
+/// both derive (and can verify) the identical token for a given epoch; rotating
+/// the epoch rotates the token without re-provisioning. Comparison is
+/// constant-time.
+///
+/// **Scope:** [implemented] + [tested] as a typed, rotating capability over the
+/// provisioned secret. It is **not yet carried on the runtime handshake wire**
+/// (the runtime handshake authenticates with the per-transcript HMAC capability
+/// in `generic::oob_*`); binding the `SessionToken` into that transcript is
+/// tracked as [design] in `docs/OUT_OF_BAND_IDENTITY.md`.
+#[derive(Clone)]
+pub struct SessionToken([u8; 32]);
+
+impl SessionToken {
+    /// Derive the token for `epoch` from a peer's `auth_secret`.
+    fn derive(auth_secret: &[u8], epoch: u64) -> Self {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(auth_secret)
+            .expect("HMAC accepts any key length");
+        mac.update(b"syntriass-overlay oob session-token v1");
+        mac.update(&epoch.to_le_bytes());
+        Self(mac.finalize().into_bytes().into())
+    }
+
+    /// Constant-time equality (no early-exit timing oracle on the token).
+    pub fn verify(&self, other: &SessionToken) -> bool {
+        use subtle::ConstantTimeEq;
+        self.0.ct_eq(&other.0).into()
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -111,6 +147,16 @@ impl PeerRecord {
     fn hash(&self) -> IdentityKeyHash {
         IdentityKeyHash::of(&self.ed25519_pub, &self.mldsa65_pub)
     }
+
+    /// The session token authorizing this peer for `epoch` (see [`SessionToken`]).
+    pub fn session_token(&self, epoch: u64) -> SessionToken {
+        SessionToken::derive(&self.auth_secret[..], epoch)
+    }
+
+    /// Whether this record's lifetime covers `now` (0 = no expiry).
+    pub fn is_valid_at(&self, now: u64) -> bool {
+        self.not_after == 0 || now < self.not_after
+    }
 }
 
 /// Out-of-band peer identity registry + cache. Provisioned out-of-band; the
@@ -120,6 +166,7 @@ impl PeerRecord {
 #[derive(Default)]
 pub struct PeerRegistry {
     by_hash: HashMap<[u8; 32], PeerRecord>,
+    revoked: HashSet<[u8; 32]>,
     hits: u64,
     misses: u64,
 }
@@ -129,15 +176,25 @@ impl PeerRegistry {
         Self::default()
     }
 
-    /// Provision a peer (out-of-band). Returns its `IdentityKeyHash`.
+    /// Provision a peer (out-of-band). Returns its `IdentityKeyHash`. Provisioning
+    /// also clears any prior revocation of that exact identity (re-instatement is
+    /// an explicit operator action).
     pub fn provision(&mut self, record: PeerRecord) -> IdentityKeyHash {
         let h = record.hash();
+        self.revoked.remove(&h.0);
         self.by_hash.insert(h.0, record);
         h
     }
 
     /// Cache lookup by hash (records a hit/miss for the cache metrics).
+    /// **Fail-closed:** a revoked hash yields `None` (counted as a miss) even
+    /// though the record may still be present — a revoked identity can never
+    /// resolve, so it can neither initiate nor be responded to.
     pub fn lookup(&mut self, hash: &IdentityKeyHash) -> Option<&PeerRecord> {
+        if self.revoked.contains(&hash.0) {
+            self.misses += 1;
+            return None;
+        }
         if self.by_hash.contains_key(&hash.0) {
             self.hits += 1;
             self.by_hash.get(&hash.0)
@@ -145,6 +202,27 @@ impl PeerRegistry {
             self.misses += 1;
             None
         }
+    }
+
+    /// Revoke an identity. Subsequent lookups fail closed. Idempotent; revoking an
+    /// unknown hash is allowed (pre-emptive revocation).
+    pub fn revoke(&mut self, hash: &IdentityKeyHash) {
+        self.revoked.insert(hash.0);
+    }
+
+    /// Lift a revocation (re-instate). Returns whether the hash was revoked.
+    pub fn unrevoke(&mut self, hash: &IdentityKeyHash) -> bool {
+        self.revoked.remove(&hash.0)
+    }
+
+    /// Whether `hash` is currently revoked.
+    pub fn is_revoked(&self, hash: &IdentityKeyHash) -> bool {
+        self.revoked.contains(&hash.0)
+    }
+
+    /// Number of revoked identities.
+    pub fn revoked_count(&self) -> usize {
+        self.revoked.len()
     }
 
     pub fn len(&self) -> usize {
@@ -393,5 +471,65 @@ mod tests {
         assert_eq!((hits, misses), (1, 0));
         assert!(creg.lookup(&IdentityKeyHash([0xEE; 32])).is_none());
         assert_eq!(creg.cache_stats(), (1, 1));
+    }
+
+    #[test]
+    fn revoked_identity_fails_closed_on_a_real_handshake() {
+        // Healthy: the runtime OOB handshake round-trips before revocation.
+        let (mut creg, mut sreg, chash, shash, _cm, _sm) = provision();
+        let peer = creg.lookup(&shash).unwrap();
+        let (st, ch) = begin_initiator(&chash, peer, 1_000).unwrap();
+        let (mut sk, sh, who) = respond(&shash, &mut sreg, 1_000, &ch).unwrap();
+        assert_eq!(who, chash);
+        let mut ck = finish(st, &sh).unwrap();
+        let ct = ck.seal(b"pre-revocation").unwrap();
+        assert_eq!(sk.open(&ct).unwrap(), b"pre-revocation");
+
+        // The server revokes the client's identity. The very next handshake must
+        // fail closed: the responder no longer resolves the revoked hash.
+        assert!(!sreg.is_revoked(&chash));
+        sreg.revoke(&chash);
+        assert!(sreg.is_revoked(&chash));
+        assert_eq!(sreg.revoked_count(), 1);
+
+        let peer = creg.lookup(&shash).unwrap();
+        let (_st2, ch2) = begin_initiator(&chash, peer, 1_001).unwrap();
+        assert_eq!(
+            respond(&shash, &mut sreg, 1_001, &ch2).unwrap_err(),
+            CryptoError::Authentication,
+            "a revoked identity must be rejected (fail closed)"
+        );
+
+        // The initiator side can also revoke its peer: it then cannot even begin.
+        creg.revoke(&shash);
+        assert!(
+            creg.lookup(&shash).is_none(),
+            "revoked peer does not resolve"
+        );
+
+        // Re-instating clears the revocation.
+        assert!(sreg.unrevoke(&chash));
+        assert_eq!(sreg.revoked_count(), 0);
+    }
+
+    #[test]
+    fn session_token_agrees_across_peers_and_rotates_by_epoch() {
+        // Both peers hold the same auth_secret, so both derive the same token for
+        // an epoch; different epochs give different tokens; comparison is CT.
+        let (mut creg, mut sreg, chash, shash, _cm, _sm) = provision();
+        let client_view = creg.lookup(&shash).unwrap().session_token(7);
+        let server_view = sreg.lookup(&chash).unwrap().session_token(7);
+        assert!(
+            client_view.verify(&server_view),
+            "both sides derive the same session token for the same epoch"
+        );
+        let next = creg.lookup(&shash).unwrap().session_token(8);
+        assert!(
+            !client_view.verify(&next),
+            "rotating the epoch rotates the token"
+        );
+        // tokens are 32 bytes and non-trivial
+        assert_eq!(client_view.as_bytes().len(), 32);
+        assert_ne!(client_view.as_bytes(), &[0u8; 32]);
     }
 }
