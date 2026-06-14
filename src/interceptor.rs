@@ -219,7 +219,20 @@ unsafe fn is_stream_socket(fd: c_int) -> bool {
         &mut stype as *mut _ as *mut c_void,
         &mut slen,
     );
-    ok == 0 && stype == libc::SOCK_STREAM
+    if ok == 0 {
+        return stype == libc::SOCK_STREAM;
+    }
+    // SECURITY (fail-closed on indeterminate, finding PRE-AUDIT C-1): a failed
+    // SO_TYPE probe must NOT be treated as "not our socket" — that path falls
+    // through to real libc and would leak the application's PLAINTEXT. Only
+    // ENOTSOCK (genuinely a regular file / pipe — the legitimate pass-through
+    // case) and EBADF (the real call will itself return EBADF; nothing is sent)
+    // are safe to pass through. ANY OTHER errno (EINTR, ENOBUFS, transient
+    // failures during fd-table churn) means the fd IS a socket whose type we
+    // could not read; we treat it AS a stream socket so the data path tracks it
+    // and fails closed rather than emitting cleartext.
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno != libc::ENOTSOCK && errno != libc::EBADF
 }
 
 unsafe fn block_stream_egress(fd: c_int) -> bool {
@@ -1404,5 +1417,68 @@ mod negotiation_tests {
         st.rx_wire.extend_from_slice(&f);
         drive_handshake(&mut st);
         assert!(matches!(st.phase, FdPhase::Failed));
+    }
+}
+
+#[cfg(test)]
+mod socket_classification_tests {
+    //! Regression guard for PRE-AUDIT finding C-1 (fail-open on an indeterminate
+    //! socket-type probe). The fix must (a) keep regular files / pipes classified
+    //! as NOT-our-socket so they pass through to real libc unchanged, while
+    //! (b) classifying real stream sockets as ours. The security-critical third
+    //! case — a socket whose `SO_TYPE` probe fails with a transient (non-ENOTSOCK)
+    //! errno — must be treated as a stream socket so the data path fails closed;
+    //! that errno path cannot be forced deterministically here, so we pin the two
+    //! observable classifications that bracket it and document the invariant.
+    use super::*;
+    use std::os::unix::io::{AsRawFd, IntoRawFd};
+
+    #[test]
+    fn regular_file_is_not_a_stream_socket_passthrough_preserved() {
+        // A regular file's SO_TYPE probe returns ENOTSOCK -> must be pass-through
+        // (false). If this regressed to `true`, file writes would be wrongly
+        // intercepted; if the C-1 fix wrongly treated ENOTSOCK as indeterminate,
+        // this would also fail.
+        let f = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = f.as_raw_fd();
+        assert!(
+            !unsafe { is_stream_socket(fd) },
+            "a regular file (ENOTSOCK) must NOT be treated as a stream socket"
+        );
+    }
+
+    #[test]
+    fn tcp_stream_socket_is_classified_ours() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let fd = listener.into_raw_fd();
+        assert!(
+            unsafe { is_stream_socket(fd) },
+            "a real SOCK_STREAM socket must be classified as ours"
+        );
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn udp_datagram_socket_is_not_stream() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp");
+        let fd = sock.into_raw_fd();
+        // SO_TYPE succeeds and reports SOCK_DGRAM -> not a stream socket.
+        assert!(
+            !unsafe { is_stream_socket(fd) },
+            "a SOCK_DGRAM socket must not be classified as a stream socket"
+        );
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn ebadf_is_passthrough_not_intercepted() {
+        // An invalid fd probes EBADF; the real libc call will itself return EBADF
+        // (nothing is ever sent), so it is safe to pass through rather than fail
+        // closed. Guards against the C-1 fix over-broadly capturing EBADF.
+        let bad_fd: c_int = 100_000; // not open in the test process
+        assert!(
+            !unsafe { is_stream_socket(bad_fd) },
+            "EBADF must remain pass-through (the real call returns EBADF; no leak)"
+        );
     }
 }
