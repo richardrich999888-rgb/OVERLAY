@@ -1,0 +1,17 @@
+# SYNTRIASS Overlay — node identity (/etc/syntriass/identity.toml)
+#
+# This file holds THIS node's secret seeds and the trusted PEER's public keys.
+# Fail-closed: the daemon refuses to start unless all four fields are present and
+# correctly sized. Never commit a real identity.toml; keep it mode 0600, owner
+# syntriass. Provision with:  syntriass-overlay-install --provision-self
+#
+# Field sizes (hex characters):
+#   ed25519_seed          = 64   (32 bytes, THIS node's secret — keep secret)
+#   mldsa65_seed          = 64   (32 bytes, THIS node's secret — keep secret)
+#   peer_ed25519_public   = 64   (32 bytes, the trusted peer's public key)
+#   peer_mldsa65_public   = 3904 (1952 bytes, the trusted peer's public key)
+
+ed25519_seed = ""
+mldsa65_seed = ""
+peer_ed25519_public = ""
+peer_mldsa65_public = ""

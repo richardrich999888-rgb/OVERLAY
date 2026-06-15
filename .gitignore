@@ -3,3 +3,25 @@ dist/
 files.zip
 files_unzipped/
 tests/__pycache__/
+
+# Mininet range runtime artifacts
+benchmarks/mininet_local_range/raw_logs.txt
+*.pcap
+
+# cargo-fuzz generated artifacts (host-only; not committed)
+/fuzz/Cargo.lock
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# eBPF build artifacts (host-built; sources are committed)
+/ebpf/c/connect4.bpf.o
+/ebpf/c/loader
+/ebpf/c/policy.bpf.o
+/ebpf/c/policy_loader
+/ebpf/c/policy_v2.bpf.o
+/ebpf/c/policy_v2_loader
+
+# deployment packages (built artifacts)
+/dist/

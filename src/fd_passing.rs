@@ -28,14 +28,23 @@ pub fn send_fd(uds: RawFd, payload: &[u8], fd: RawFd) -> io::Result<()> {
 
     // 8-byte-aligned control buffer (generous; a one-fd cmsg needs 24 bytes).
     let mut cbuf = [0u64; 8];
+    // SAFETY: `CMSG_SPACE` is a pure arithmetic libc macro; it dereferences no
+    // pointers and cannot fail.
     let cmsg_space = unsafe { libc::CMSG_SPACE(mem::size_of::<c_int>() as u32) } as usize;
 
+    // SAFETY: `msghdr` is a C plain-old-data struct; an all-zero bit pattern is a
+    // valid, fully-initialized value (the fields we do not set are zero by spec).
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr() as *mut c_void;
     msg.msg_controllen = cmsg_space;
 
+    // SAFETY: `cbuf` is 64 bytes — at least `CMSG_SPACE(one fd)` (24) — and `msg`
+    // points at it, so `CMSG_FIRSTHDR` returns either NULL (checked) or a pointer
+    // strictly inside `cbuf`. We then write only the cmsg header fields and a
+    // single `c_int` at `CMSG_DATA`, all within that buffer; `write_unaligned`
+    // tolerates the natural cmsg-data misalignment.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
@@ -47,6 +56,8 @@ pub fn send_fd(uds: RawFd, payload: &[u8], fd: RawFd) -> io::Result<()> {
         ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut c_int, fd);
     }
 
+    // SAFETY: `msg` and every buffer it references (`iov`, `cbuf`) are live locals
+    // that outlive this synchronous call; the kernel only reads them.
     let sent = unsafe { libc::sendmsg(uds, &msg, 0) };
     if sent < 0 {
         return Err(io::Error::last_os_error());
@@ -68,14 +79,18 @@ pub fn recv_fd(uds: RawFd) -> io::Result<(Vec<u8>, Option<RawFd>)> {
         iov_len: databuf.len(),
     };
     let mut cbuf = [0u64; 8];
+    // SAFETY: pure arithmetic libc macro; dereferences nothing.
     let cmsg_space = unsafe { libc::CMSG_SPACE(mem::size_of::<c_int>() as u32) } as usize;
 
+    // SAFETY: `msghdr` is C POD; all-zero is a valid initialized value.
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr() as *mut c_void;
     msg.msg_controllen = cmsg_space;
 
+    // SAFETY: `msg` references live locals (`iov` -> `databuf`, `cbuf`) sized for
+    // the call; the kernel writes only within them and reports the count in `n`.
     let n = unsafe { libc::recvmsg(uds, &mut msg, 0) };
     if n < 0 {
         return Err(io::Error::last_os_error());
@@ -87,8 +102,15 @@ pub fn recv_fd(uds: RawFd) -> io::Result<(Vec<u8>, Option<RawFd>)> {
         return Ok((data, None));
     }
 
+    // SAFETY: pure arithmetic libc macro.
     let header_len = unsafe { libc::CMSG_LEN(0) } as usize;
     let mut received: Option<RawFd> = None;
+    // SAFETY: we walk the cmsg list with the libc `CMSG_*` iterators, which stay
+    // within `cbuf` (the control buffer `recvmsg` just populated). For an
+    // `SCM_RIGHTS` cmsg we read exactly `nfds` `c_int`s out of `CMSG_DATA` (its
+    // length is derived from the kernel-reported `cmsg_len`); fds beyond the one
+    // we keep are `close`d so no descriptor is leaked. Any non-conforming control
+    // data leaves `received == None` (fail closed).
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {

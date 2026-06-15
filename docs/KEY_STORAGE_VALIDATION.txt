@@ -1,0 +1,15 @@
+Captured run — see scripts/keystore/validate.sh
+
+================ SOVEREIGN KEY STORAGE — external backend validation ================
+host: 6.18.5 x86_64   date: 2026-06-11T19:31:58Z
+
+---- TPM 2.0 backend (swtpm software TPM) ----
+  seal/unseal round-trip ......... PASS (sealed=216B)
+  rust: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.19s
+
+---- PKCS#11 / HSM backend (SoftHSM2 software token) ----
+  in-module ECDSA sign ........... PASS (sig=64B, key non-extractable)
+  rust: [Pkcs11 keystore] sealed + transported + unsealed both hybrid seeds; signer reconstructed
+  rust: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.10s
+
+RESULT: PASS — external key-storage backends validated against software substitutes.

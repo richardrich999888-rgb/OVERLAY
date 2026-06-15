@@ -1,0 +1,475 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// Syntriass eBPF Policy Engine v2 — Phase 1: Policy Object Model.
+//
+// The Phase-3 scaffold (`policy.bpf.c`) drove egress from a single `u32`
+// posture flag. This program replaces that flag with a *structured policy
+// object* held in a BPF hash map, looked up per-flow by the kernel and
+// distributed by userspace. Each cgroup (the unit a process group is confined
+// to) carries one `struct syntriass_policy`; the `cgroup/connect4` hook resolves
+// the calling task's cgroup, fetches its policy, and makes a fail-closed egress
+// decision from the object's fields.
+//
+// Maps:
+//   policy_table   HASH<u64 cgroup_id, struct syntriass_policy>  (userspace -> kernel)
+//   session_state  HASH<u64 (daddr<<16|dport), u8>               (kernel -> userspace)
+//   events         RINGBUF  one structured decision record       (kernel -> userspace)
+//
+// Fail-closed invariants (Phase-1 enforcement surface):
+//   * map miss (no policy for this cgroup)      -> DENY  (REASON_NO_POLICY)
+//   * policy present but expired                 -> DENY  (REASON_EXPIRED)
+//   * posture == FailClosed                      -> DENY  (REASON_FAILCLOSED)
+//   * otherwise (FullPqc / EncryptedFallback)    -> ALLOW, record session
+// There is no posture value that yields plaintext: ALLOW only ever marks an
+// encrypted session (FullPqc or EncryptedFallback); the overlay seals the bytes.
+
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+#define MODE_FULL_PQC 0u
+#define MODE_ENCRYPTED_FALLBACK 1u
+#define MODE_FAIL_CLOSED 2u
+
+#define REASON_OK 0u
+#define REASON_NO_POLICY 1u
+#define REASON_EXPIRED 2u
+#define REASON_FAILCLOSED 3u
+#define REASON_CRYPTO 4u     // crypto policy forbids this connection (e.g. a fallback)
+#define REASON_QUARANTINE 5u // the cgroup is quarantined — highest-priority deny
+
+// Quarantine kinds (Phase 4).
+#define QUAR_TEMPORARY 0u   // auto-releases at expiry_ns (duration-based)
+#define QUAR_PERMANENT 1u   // never auto-releases; manual release only (delete)
+#define QUAR_AUTO_EXPIRY 2u // auto-releases at expiry_ns (absolute-deadline based)
+
+// Cryptographic policy flags (Phase 3). The kernel enforces the data-plane
+// *consequence* it can see — whether a fallback (EncryptedFallback) connection is
+// permitted; the suite/hardware-key requirements are enforced at handshake time
+// by the daemon (it sees the negotiated suite; the connect4 hook does not).
+#define CRYPTO_FULL_PQC_ONLY (1u << 0)    // forbid any fallback connection
+#define CRYPTO_HYBRID_ONLY (1u << 1)      // require X25519+ML-KEM (handshake-time)
+#define CRYPTO_FALLBACK_ALLOWED (1u << 2) // permit the encrypted PSK fallback
+#define CRYPTO_HARDWARE_KEY_REQ (1u << 3) // require a hardware-backed key (handshake-time)
+#define CRYPTO_NO_CLASSICAL_FB (1u << 4)  // forbid any classical-only fallback
+
+// The structured policy object. Field order keeps the three u64s first so the
+// 32-byte identity hash and the u32s stay naturally aligned; total 72 bytes.
+struct syntriass_policy {
+    __u64 policy_id;               // opaque unique id (userspace-assigned)
+    __u64 cgroup_id;               // selector (informational; key duplicates it)
+    __u64 expiry_ns;              // absolute bpf_ktime_get_ns(); 0 = never expires
+    __u8 peer_identity_hash[32];  // SHA-256(peer identity); all-zero = any peer
+    __u32 interface_id;           // ifindex this policy binds to; 0 = any
+    __u32 posture;                // MODE_FULL_PQC / _ENCRYPTED_FALLBACK / _FAIL_CLOSED
+    __u32 priority;               // higher wins on conflict (Phase 2 hierarchy)
+    __u32 crypto_flags;           // CRYPTO_* bitmask (Phase 3)
+    __u8 fallback_allowed;        // may degrade to EncryptedFallback (1) or not (0)
+    __u8 audit_enabled;           // emit a ring-buffer audit record (1) or not (0)
+    __u8 _pad[2];
+};
+
+// Policy levels (least specific -> most specific). The effective policy is the
+// applicable candidate with the Highest Priority; ties break toward the more
+// specific level (Session > Application > Node > Global).
+#define LEVEL_GLOBAL 0u
+#define LEVEL_NODE 1u
+#define LEVEL_APP 2u
+#define LEVEL_SESSION 3u
+
+// Audit event categories (Phase 5).
+#define EV_DECISION 0u   // a normal allow/deny from posture
+#define EV_VIOLATION 1u  // a crypto-policy rejection
+#define EV_FALLBACK 2u   // an EncryptedFallback connection was allowed
+#define EV_QUARANTINE 3u // a quarantine deny
+
+// A structured audit/decision record (kernel -> userspace).
+struct policy_event {
+    __u64 policy_id;
+    __u64 cgroup_id;
+    __u64 ktime_ns; // kernel emit timestamp (CLOCK_MONOTONIC ns) for event latency
+    __u32 pid;
+    __u32 daddr;
+    __u16 dport;
+    __u16 posture;
+    __u16 decision;    // 0=allow 1=deny
+    __u16 reason;      // REASON_*
+    __u32 level;       // resolved level (LEVEL_*) that won the decision
+    __u16 event_type;  // EV_*
+    __u16 _evpad;
+};
+
+// Per-CPU audit counters (summed in userspace) — emitted vs dropped (a dropped
+// event is a ring-buffer reservation failure: the consumer fell behind).
+struct audit_stats {
+    __u64 emitted;
+    __u64 dropped;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);
+    __type(value, struct syntriass_policy);
+} policy_table SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, __u8);
+} session_state SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 22);
+} events SEC(".maps");
+
+// Phase 5: audit counters + wakeup-policy config.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct audit_stats);
+} audit_stats_map SEC(".maps");
+
+// audit_cfg[0] = ring-buffer submit flags. 0 = adaptive wakeup (default);
+// set BPF_RB_NO_WAKEUP (2) to suppress per-event consumer wakeups (the consumer
+// polls instead) — this removes the per-connect wakeup cost measured in Phase 1.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} audit_cfg SEC(".maps");
+
+// Emit one structured audit record, counting emitted/dropped per CPU and honoring
+// the configured ring-buffer wakeup policy.
+static __always_inline void emit_event(struct bpf_sock_addr *ctx, __u64 cgid,
+                                       __u64 policy_id, __u16 posture, __u16 decision,
+                                       __u16 reason, __u32 level, __u16 etype) {
+    __u32 z = 0;
+    struct audit_stats *st = bpf_map_lookup_elem(&audit_stats_map, &z);
+    struct policy_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        if (st) st->dropped += 1; // reservation failed: consumer fell behind
+        return;
+    }
+    __u64 id = bpf_get_current_pid_tgid();
+    e->policy_id = policy_id;
+    e->cgroup_id = cgid;
+    e->ktime_ns = bpf_ktime_get_ns();
+    e->pid = id >> 32;
+    e->daddr = ctx->user_ip4;
+    e->dport = bpf_ntohs(ctx->user_port);
+    e->posture = posture;
+    e->decision = decision;
+    e->reason = reason;
+    e->level = level;
+    e->event_type = etype;
+    e->_evpad = 0;
+    __u64 *flags = bpf_map_lookup_elem(&audit_cfg, &z);
+    __u64 fl = flags ? *flags : 0;
+    bpf_ringbuf_submit(e, fl);
+    if (st) st->emitted += 1;
+}
+
+// Classify a decision into an audit category.
+static __always_inline __u16 event_category(__u16 decision, __u16 reason, __u32 posture) {
+    if (reason == REASON_QUARANTINE) return EV_QUARANTINE;
+    if (reason == REASON_CRYPTO) return EV_VIOLATION;
+    if (decision == 0 && posture == MODE_ENCRYPTED_FALLBACK) return EV_FALLBACK;
+    return EV_DECISION;
+}
+
+// Hierarchy levels (Phase 2). policy_table above is the Application level (keyed
+// by cgroup id). Global and Node are singletons; Session is keyed by flow tuple.
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct syntriass_policy);
+} global_policy SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct syntriass_policy);
+} node_policy SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64); // (daddr<<16 | dport)
+    __type(value, struct syntriass_policy);
+} session_policy SEC(".maps");
+
+// Quarantine (Phase 4): a quarantined cgroup is denied ALL egress, overriding
+// every policy level — the highest-priority deny. Temporary/AutoExpiry release
+// automatically at expiry_ns; Permanent only on manual delete.
+struct quarantine_entry {
+    __u64 quarantine_id; // opaque id (audit correlation)
+    __u64 expiry_ns;     // absolute bpf_ktime_get_ns(); 0 = no expiry (Permanent)
+    __u32 kind;          // QUAR_*
+    __u32 _qpad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64); // cgroup_id
+    __type(value, struct quarantine_entry);
+} quarantine SEC(".maps");
+
+// Is this cgroup currently under active quarantine?
+static __always_inline int syntriass_quarantined(__u64 cgid) {
+    struct quarantine_entry *q = bpf_map_lookup_elem(&quarantine, &cgid);
+    if (!q) return 0;
+    if (q->kind == QUAR_PERMANENT) return 1; // never auto-releases
+    // Temporary / AutoExpiry: active until the deadline passes (then auto-release).
+    return (q->expiry_ns != 0 && bpf_ktime_get_ns() <= q->expiry_ns);
+}
+
+// A candidate is applicable if present and not expired. Among applicable
+// candidates the highest priority wins; the macro is invoked from least- to
+// most-specific level, and `>=` lets a more specific level win an equal-priority
+// tie. `best`, `best_prio`, `best_level`, `now` are the enclosing locals.
+// policy_id == 0 marks an absent/empty slot (ARRAY levels always have index 0
+// present, so absence is encoded by a zeroed object rather than a map miss).
+#define CONSIDER(pptr, lvl)                                                      \
+    do {                                                                         \
+        struct syntriass_policy *_c = (pptr);                                    \
+        if (_c && _c->policy_id != 0 &&                                          \
+            !(_c->expiry_ns != 0 && now > _c->expiry_ns) &&                      \
+            (long long)_c->priority >= best_prio) {                             \
+            best = _c;                                                           \
+            best_prio = (long long)_c->priority;                                 \
+            best_level = (lvl);                                                  \
+        }                                                                        \
+    } while (0)
+
+// Resolve the effective policy across the four levels for this flow. Returns the
+// winning policy (or NULL if no applicable policy exists at any level) and writes
+// the winning level to *out_level.
+static __always_inline struct syntriass_policy *
+syntriass_resolve(__u64 cgid, __u64 flowkey, __u32 *out_level) {
+    __u64 now = bpf_ktime_get_ns();
+    struct syntriass_policy *best = 0;
+    long long best_prio = -1;
+    __u32 best_level = LEVEL_GLOBAL;
+    __u32 z = 0;
+
+    CONSIDER(bpf_map_lookup_elem(&global_policy, &z), LEVEL_GLOBAL);
+    CONSIDER(bpf_map_lookup_elem(&node_policy, &z), LEVEL_NODE);
+    CONSIDER(bpf_map_lookup_elem(&policy_table, &cgid), LEVEL_APP);
+    CONSIDER(bpf_map_lookup_elem(&session_policy, &flowkey), LEVEL_SESSION);
+
+    *out_level = best_level;
+    return best;
+}
+
+SEC("cgroup/connect4")
+int syntriass_policy_v2(struct bpf_sock_addr *ctx) {
+    __u64 cgid = bpf_get_current_cgroup_id();
+    struct syntriass_policy *pol = bpf_map_lookup_elem(&policy_table, &cgid);
+
+    __u16 dport = bpf_ntohs(ctx->user_port);
+    __u32 posture;
+    __u16 reason;
+    __u64 policy_id = 0;
+    __u8 audit;
+
+    if (!pol) {
+        // No policy object for this cgroup => fail closed. Always audited so an
+        // unconfigured cgroup's blocked egress is visible.
+        posture = MODE_FAIL_CLOSED;
+        reason = REASON_NO_POLICY;
+        audit = 1;
+    } else if (pol->expiry_ns != 0 && bpf_ktime_get_ns() > pol->expiry_ns) {
+        // Expired credential => fail closed (a stale policy must not keep a
+        // channel open). Audited regardless of the object's audit flag.
+        posture = MODE_FAIL_CLOSED;
+        reason = REASON_EXPIRED;
+        policy_id = pol->policy_id;
+        audit = 1;
+    } else {
+        posture = pol->posture;
+        reason = (posture == MODE_FAIL_CLOSED) ? REASON_FAILCLOSED : REASON_OK;
+        policy_id = pol->policy_id;
+        audit = pol->audit_enabled;
+    }
+
+    __u16 decision = (posture == MODE_FAIL_CLOSED) ? 1 : 0; // 1 = deny (EPERM)
+
+    if (decision == 0) {
+        // ALLOW: mark the per-flow session (encrypted; 1=full-pqc, 2=fallback).
+        __u64 fk = ((__u64)ctx->user_ip4 << 16) | dport;
+        __u8 st = (__u8)(posture + 1);
+        bpf_map_update_elem(&session_state, &fk, &st, BPF_ANY);
+    }
+
+    if (audit) {
+        __u16 etype = event_category(decision, reason, posture);
+        emit_event(ctx, cgid, policy_id, (__u16)posture, decision, reason, LEVEL_APP, etype);
+    }
+
+    return decision ? 0 : 1; // 0 = deny, 1 = allow
+}
+
+// Lookup-only variant: resolves the cgroup's policy object and makes the
+// fail-closed decision (map miss / expired / FailClosed -> deny; else allow) with
+// NO audit ring-buffer write and NO session marking. Attaching ONLY this program
+// and bursting connects through it isolates the policy *lookup + decision* cost
+// from the audit/telemetry cost (Phase 5), via the kernel's run-time accounting.
+SEC("cgroup/connect4")
+int syntriass_policy_lookup_bench(struct bpf_sock_addr *ctx) {
+    (void)ctx;
+    __u64 cgid = bpf_get_current_cgroup_id();
+    struct syntriass_policy *pol = bpf_map_lookup_elem(&policy_table, &cgid);
+    if (!pol) return 0; // map miss => fail closed
+    if (pol->expiry_ns != 0 && bpf_ktime_get_ns() > pol->expiry_ns) return 0; // expired
+    return (pol->posture == MODE_FAIL_CLOSED) ? 0 : 1;
+}
+
+// Phase 2: hierarchical enforcement. Resolves the effective policy across
+// Global/Node/Application/Session (highest priority wins, more-specific breaks
+// ties), then applies the same fail-closed decision rules as Phase 1. Emits a
+// structured audit record carrying the winning level.
+SEC("cgroup/connect4")
+int syntriass_policy_hier(struct bpf_sock_addr *ctx) {
+    __u64 cgid = bpf_get_current_cgroup_id();
+    __u16 dport = bpf_ntohs(ctx->user_port);
+    __u64 flowkey = ((__u64)ctx->user_ip4 << 16) | dport;
+
+    __u32 level = LEVEL_GLOBAL;
+    __u32 posture;
+    __u16 reason;
+    __u64 policy_id = 0;
+
+    // Quarantine is the highest-priority deny — it overrides every policy level.
+    if (syntriass_quarantined(cgid)) {
+        emit_event(ctx, cgid, 0, MODE_FAIL_CLOSED, 1, REASON_QUARANTINE, level,
+                   EV_QUARANTINE);
+        return 0; // deny (EPERM)
+    }
+
+    struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
+
+    if (!pol) {
+        posture = MODE_FAIL_CLOSED;
+        reason = REASON_NO_POLICY; // no applicable policy at any level
+    } else {
+        posture = pol->posture;
+        reason = (posture == MODE_FAIL_CLOSED) ? REASON_FAILCLOSED : REASON_OK;
+        policy_id = pol->policy_id;
+    }
+    __u16 decision = (posture == MODE_FAIL_CLOSED) ? 1 : 0;
+
+    // Crypto policy gate (Phase 3): the kernel enforces the consequence it can
+    // see — is a fallback (EncryptedFallback) connection permitted at all? It is
+    // only permitted when FALLBACK_ALLOWED is set and FullPqcOnly does not forbid
+    // it; otherwise fail closed (REASON_CRYPTO). The *nature* of the fallback
+    // (classical vs symmetric, NO_CLASSICAL_FB) and the suite/hardware-key
+    // requirements are enforced at handshake time by the daemon, which sees them.
+    if (decision == 0 && pol && posture == MODE_ENCRYPTED_FALLBACK) {
+        __u32 cf = pol->crypto_flags;
+        if ((cf & CRYPTO_FULL_PQC_ONLY) || !(cf & CRYPTO_FALLBACK_ALLOWED)) {
+            decision = 1;
+            reason = REASON_CRYPTO;
+        }
+    }
+
+    if (decision == 0) {
+        __u8 st = (__u8)(posture + 1);
+        bpf_map_update_elem(&session_state, &flowkey, &st, BPF_ANY);
+    }
+
+    __u8 audit = pol ? pol->audit_enabled : 1;
+    if (audit) {
+        __u16 etype = event_category(decision, reason, posture);
+        emit_event(ctx, cgid, policy_id, (__u16)posture, decision, reason, level, etype);
+    }
+    return decision ? 0 : 1;
+}
+
+// Lookup-only hierarchical variant: full 4-level resolution + decision, NO audit
+// and NO session marking, to isolate the inheritance-resolution cost.
+SEC("cgroup/connect4")
+int syntriass_policy_hier_bench(struct bpf_sock_addr *ctx) {
+    __u64 cgid = bpf_get_current_cgroup_id();
+    __u16 dport = bpf_ntohs(ctx->user_port);
+    __u64 flowkey = ((__u64)ctx->user_ip4 << 16) | dport;
+    __u32 level = LEVEL_GLOBAL;
+    if (syntriass_quarantined(cgid)) return 0; // quarantine short-circuits resolve
+    struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
+    if (!pol) return 0;
+    if (pol->posture == MODE_FAIL_CLOSED) return 0;
+    if (pol->posture == MODE_ENCRYPTED_FALLBACK) {
+        __u32 cf = pol->crypto_flags;
+        if ((cf & CRYPTO_FULL_PQC_ONLY) || !(cf & CRYPTO_FALLBACK_ALLOWED))
+            return 0; // crypto policy forbids the fallback
+    }
+    return 1;
+}
+
+// HI-1 remediation — IPv6 egress coverage. The policy decision (quarantine +
+// hierarchical resolve + posture) is cgroup-keyed and therefore address-family
+// independent; only the per-flow session_state key uses the destination, so this
+// mirror builds an IPv6 flow key from the low 64 bits of the v6 address. Without
+// this program, an application egressing over IPv6 bypassed the policy entirely
+// (fail-open). Compile-verified here; attach/enforcement validation on a live
+// kernel is the deployment step (see docs/EGRESS_COVERAGE_REVIEW.md).
+SEC("cgroup/connect6")
+int syntriass_policy_hier6(struct bpf_sock_addr *ctx) {
+    __u64 cgid = bpf_get_current_cgroup_id();
+    __u16 dport = bpf_ntohs(ctx->user_port);
+    // Low 64 bits of the v6 destination + port form a per-flow key (best-effort;
+    // the security decision does not depend on it).
+    __u64 a = ((__u64)ctx->user_ip6[2] << 32) | (__u64)ctx->user_ip6[3];
+    __u64 flowkey = (a << 16) | dport;
+
+    if (syntriass_quarantined(cgid)) {
+        emit_event(ctx, cgid, 0, MODE_FAIL_CLOSED, 1, REASON_QUARANTINE, LEVEL_GLOBAL,
+                   EV_QUARANTINE);
+        return 0; // deny (EPERM)
+    }
+
+    __u32 level = LEVEL_GLOBAL;
+    struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
+
+    __u32 posture;
+    __u16 reason;
+    __u64 policy_id = 0;
+    if (!pol) {
+        posture = MODE_FAIL_CLOSED;
+        reason = REASON_NO_POLICY;
+    } else {
+        posture = pol->posture;
+        reason = (posture == MODE_FAIL_CLOSED) ? REASON_FAILCLOSED : REASON_OK;
+        policy_id = pol->policy_id;
+    }
+    __u16 decision = (posture == MODE_FAIL_CLOSED) ? 1 : 0;
+
+    if (decision == 0 && pol && posture == MODE_ENCRYPTED_FALLBACK) {
+        __u32 cf = pol->crypto_flags;
+        if ((cf & CRYPTO_FULL_PQC_ONLY) || !(cf & CRYPTO_FALLBACK_ALLOWED)) {
+            decision = 1;
+            reason = REASON_CRYPTO;
+        }
+    }
+
+    if (decision == 0) {
+        __u8 st = (__u8)(posture + 1);
+        bpf_map_update_elem(&session_state, &flowkey, &st, BPF_ANY);
+    }
+
+    __u8 audit = pol ? pol->audit_enabled : 1;
+    if (audit) {
+        __u16 etype = event_category(decision, reason, posture);
+        emit_event(ctx, cgid, policy_id, (__u16)posture, decision, reason, level, etype);
+    }
+    return decision ? 0 : 1;
+}
+
+char LICENSE[] SEC("license") = "GPL";

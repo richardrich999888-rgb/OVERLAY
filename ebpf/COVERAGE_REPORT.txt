@@ -1,0 +1,26 @@
+Syntriass universal-interception coverage — MEASURED EVIDENCE
+Generated: 2026-06-11T13:38:29Z  host-kernel: 6.18.5 x86_64
+clang: Ubuntu clang version 18.1.3 (1ubuntu1)   libbpf: 1.3.0
+Reproduce: sudo bash scripts/ebpf_coverage_validate.sh
+NOTE: requires a BPF-capable host (root/CAP_BPF+CAP_SYS_ADMIN, cgroup v2).
+      It is NOT run in the default CI sandbox; this file is the captured run.
+
+
+================ UNIVERSAL INTERCEPTION COVERAGE (measured) ================
+runtime          port    observed  evidence (comm/dst from eBPF)
+glibc            51001   YES       comm=mx_glibc pid=31206 uid=0 dst=127.0.0.1:51001 action=ALLOW
+static-glibc     51002   YES       comm=mx_static pid=31207 uid=0 dst=127.0.0.1:51002 action=ALLOW
+go               51003   YES       comm=mx_go pid=31208 uid=0 dst=127.0.0.1:51003 action=ALLOW
+rust             51004   YES       comm=mx_rust pid=31213 uid=0 dst=127.0.0.1:51004 action=ALLOW
+rust-musl        51005   YES       comm=mx_rustmusl pid=31214 uid=0 dst=127.0.0.1:51005 action=ALLOW
+direct-syscall   51006   YES       comm=mx_direct pid=31215 uid=0 dst=127.0.0.1:51006 action=ALLOW
+python           51007   YES       comm=python3 pid=31216 uid=0 dst=127.0.0.1:51007 action=ALLOW
+total events captured: 7
+
+================ ENFORCEMENT (fail-closed deny) ================
+blocked port 51999 had a LIVE listener; connect result under eBPF deny:
+  MX rc=-1 errno=1(Operation not permitted)
+  -> EPERM: connection DENIED by eBPF despite a live server (fail-closed OK)
+  -> eBPF event: comm=mx_glibc pid=31269 uid=0 dst=127.0.0.1:51999 action=DENY
+
+RESULT: PASS — every available runtime intercepted; enforcement denied.

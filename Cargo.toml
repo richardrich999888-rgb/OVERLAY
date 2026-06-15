@@ -16,6 +16,14 @@ crate-type = ["cdylib", "rlib"]
 name = "demo_benchmarks"
 harness = false
 
+[[bench]]
+name = "identity_benchmarks"
+harness = false
+
+[[bench]]
+name = "oob_benchmarks"
+harness = false
+
 [dependencies]
 # Raw FFI: dlsym/RTLD_NEXT, errno, fcntl, the real send/recv/connect. No SHA, no crypto here.
 libc = "=0.2.168"
@@ -32,6 +40,13 @@ aes-gcm = "=0.10.3"
 # Key schedule.
 hkdf = "=0.12.4"
 sha2 = "=0.10.8"
+# Stateless handshake-cookie MAC (HMAC-SHA256) for the anti-DoS admission gate.
+# Already in the lock as a transitive dep of hkdf; promoted to a direct dep here
+# (no new package enters the tree).
+hmac = "=0.12.1"
+# Constant-time cookie/tag comparison (timing-safe admission). Already in the
+# lock via the dalek stack; promoted to a direct dep (no tree expansion).
+subtle = "=2.6.1"
 # Classical identity signatures.
 ed25519-dalek = { version = "=2.2.0", features = ["rand_core", "zeroize"] }
 # Post-quantum identity signatures (FIPS 204 ML-DSA-65).
@@ -56,6 +71,18 @@ rand = "=0.8.6"
 libc = "=0.2.168"
 # Over-socket handshake tests drive a loopback pair with two async tasks.
 tokio = { version = "=1.43.0", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
+# Exhaustive concurrency model-checking of the PQC-permit accounting
+# (tests/loom_model.rs). Dev-only: never linked into the shipped .so.
+loom = "=0.7.2"
+
+[features]
+# Compile + link the C-DAC ParaS (SYCL 2020) offload bridge (host-fallback via
+# g++; real SYCL via `parascc`). Off by default so the baseline build is unchanged.
+cdac-accel = []
+
+[build-dependencies]
+# Compiles src/accelerator/cdac_sycl_bridge.cpp under the `cdac-accel` feature.
+cc = "1.2"
 
 [profile.release]
 # `unwind` (not `abort`) so the `catch_unwind` FFI shields in interceptor.rs are
