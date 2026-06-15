@@ -92,6 +92,52 @@ fn revoked_signer_bundle_is_rejected() {
     assert_eq!(t.verify(&parsed), Err(AirgapError::RevokedSigner));
 }
 
+/// Fault injection: the new on-disk parser must NEVER panic and must fail
+/// closed on arbitrary/garbage/corrupted input (the new attack surface). Feeds a
+/// well-formed bundle mutated at every single byte position, plus random buffers.
+#[test]
+fn parser_fault_injection_never_panics_and_fails_closed() {
+    let (s, t) = anchored();
+    let good = SignedBundle::sign(BundleKind::Package, &s, 1, b"payload-data".to_vec())
+        .unwrap()
+        .to_bytes();
+
+    // Mutate each byte to each of a few values; any parse that succeeds must NOT
+    // verify (it is not the original signed object).
+    for i in 0..good.len() {
+        for delta in [0x01u8, 0x80, 0xFF] {
+            let mut m = good.clone();
+            m[i] ^= delta;
+            if let Ok(b) = SignedBundle::from_bytes(&m) {
+                assert!(
+                    t.verify(&b).is_err(),
+                    "a mutated bundle parsed but verified at byte {i}"
+                );
+            }
+        }
+    }
+
+    // Random and truncated buffers: parse must return (never panic). A success is
+    // acceptable only if verification then fails.
+    let seeds: [u64; 4] = [0x1234_5678, 0xDEAD_BEEF, 0, u64::MAX];
+    for seed in seeds {
+        let mut x = seed | 1;
+        for len in [0usize, 1, 7, 8, 50, 200, good.len()] {
+            let buf: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x & 0xff) as u8
+                })
+                .collect();
+            if let Ok(b) = SignedBundle::from_bytes(&buf) {
+                assert!(t.verify(&b).is_err());
+            }
+        }
+    }
+}
+
 #[test]
 fn truncated_media_is_rejected_structurally() {
     let (s, _t) = anchored();
