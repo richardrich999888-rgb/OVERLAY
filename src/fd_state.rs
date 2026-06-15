@@ -145,6 +145,10 @@ pub struct FdState {
     /// child inherits this value but has a different live PID, so inherited
     /// sessions can fail closed before any duplicated nonce counter is used.
     pub owner_pid: c_int,
+    /// Fork-aware process token captured at creation (CR-2). A forked child's
+    /// token differs (the `pthread_atfork` handler bumped the fork epoch), so an
+    /// inherited session is detected even when `owner_pid` matches (PID reuse).
+    pub owner_token: u64,
     /// Suite this process is configured to use (policy-pinned at startup).
     pub policy_suite: CipherSuite,
     /// Cryptographic config epoch used to establish this session.
@@ -164,6 +168,7 @@ impl FdState {
         Self {
             phase: FdPhase::ResponderAwaitingClientHello,
             owner_pid: current_pid(),
+            owner_token: current_process_token(),
             policy_suite,
             config_epoch: current_config_epoch(),
             tx_backlog: Vec::new(),
@@ -182,6 +187,7 @@ impl FdState {
         Self {
             phase: FdPhase::InitiatorAwaitingServerHello(state),
             owner_pid: current_pid(),
+            owner_token: current_process_token(),
             policy_suite,
             config_epoch: current_config_epoch(),
             tx_backlog: client_hello_frame,
@@ -202,6 +208,7 @@ impl FdState {
         Self {
             phase: FdPhase::InitiatorAwaitingFallbackFinished(state),
             owner_pid: current_pid(),
+            owner_token: current_process_token(),
             policy_suite,
             config_epoch: current_config_epoch(),
             tx_backlog: fallback_hello_frame,
@@ -216,6 +223,7 @@ impl FdState {
         Self {
             phase: FdPhase::Failed,
             owner_pid: current_pid(),
+            owner_token: current_process_token(),
             policy_suite,
             config_epoch: current_config_epoch(),
             tx_backlog: Vec::new(),
@@ -236,6 +244,14 @@ impl FdState {
 
     pub fn append_rx_plain(&mut self, bytes: &[u8]) -> Result<(), BufferError> {
         append_bounded(&mut self.rx_plain, bytes, MAX_PLAIN_RX_BUFFER)
+    }
+
+    /// CR-2: true if this session was inherited from another process image (a
+    /// forked child). Checks the fork-aware token first (robust against PID
+    /// reuse) and the live PID as a backstop. An inherited session must never
+    /// seal/open — the caller fails it closed.
+    pub fn is_inherited(&self) -> bool {
+        self.owner_token != current_process_token() || self.owner_pid != current_pid()
     }
 
     pub fn fail_closed(&mut self) {
@@ -285,6 +301,69 @@ impl FdState {
 pub fn current_pid() -> c_int {
     // SAFETY: getpid takes no arguments, touches no memory, and cannot fail.
     unsafe { libc::getpid() }
+}
+
+// --- CR-2: fork-aware process token --------------------------------------
+//
+// A forked child inherits an `Active(SessionKeys)` fd, including the AES-GCM
+// nonce counter. If both parent and child seal records they reuse a (key, nonce)
+// pair — a catastrophic GCM break. `current_pid()` alone is an unreliable guard
+// (PID reuse/wrap, clone primitives that keep the apparent PID). We add a
+// process-unique token = BASE ^ FORK_EPOCH:
+//   * BASE is a random value drawn once per process image.
+//   * FORK_EPOCH is incremented in a `pthread_atfork` CHILD handler — which runs
+//     in the child immediately after fork(), independent of the PID — so the
+//     child's token differs from the value captured in any inherited session.
+// The increment is a single atomic fetch_add (async-signal-safe, no allocation,
+// no lock), which is the only thing that may run in a post-fork child handler.
+static BASE_TOKEN: AtomicU64 = AtomicU64::new(0);
+static FORK_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn atfork_child_token_bump() {
+    // Async-signal-safe: a lone atomic increment. Makes every session captured
+    // before the fork read as inherited in this child (token mismatch).
+    FORK_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+fn ensure_atfork_registered() {
+    static REG: std::sync::Once = std::sync::Once::new();
+    REG.call_once(|| unsafe {
+        // Only a child handler; no prepare/parent handlers, so there is no
+        // lock-ordering hazard at fork.
+        libc::pthread_atfork(None, None, Some(atfork_child_token_bump));
+    });
+}
+
+fn base_token() -> u64 {
+    let b = BASE_TOKEN.load(Ordering::Acquire);
+    if b != 0 {
+        return b;
+    }
+    use rand_core::{OsRng, RngCore};
+    let mut n = OsRng.next_u64();
+    while n == 0 {
+        n = OsRng.next_u64();
+    }
+    match BASE_TOKEN.compare_exchange(0, n, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => n,
+        Err(existing) => existing,
+    }
+}
+
+/// A token that is unique to this process *image*: it changes across `fork()`
+/// (the `pthread_atfork` child handler bumps `FORK_EPOCH`). A session whose
+/// stored token differs from this value was inherited from another process and
+/// must never seal/open (CR-2). Registering the atfork handler is idempotent and
+/// happens on first use, so tests and the interceptor both get the guard.
+pub fn current_process_token() -> u64 {
+    ensure_atfork_registered();
+    base_token() ^ FORK_EPOCH.load(Ordering::Acquire)
+}
+
+/// Manually note a fork in the child (e.g. from a test, or a non-glibc clone path
+/// that bypassed `pthread_atfork`). Bumps `FORK_EPOCH`; async-signal-safe.
+pub fn note_fork_in_child() {
+    FORK_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
 pub fn current_config_epoch() -> u64 {

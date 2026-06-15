@@ -9,8 +9,8 @@
 use crate::crypto::fallback::{self, FallbackInitiator};
 use crate::crypto::{self, CipherSuite};
 use crate::fd_state::{
-    current_pid, record_blocked_bypass_attempt, record_downgrade_attack,
-    record_fallback_activation, FdPhase, FdState, MAX_WIRE_RX_BUFFER, REGISTRY,
+    record_blocked_bypass_attempt, record_downgrade_attack, record_fallback_activation, FdPhase,
+    FdState, MAX_WIRE_RX_BUFFER, REGISTRY,
 };
 use crate::kernel_native::{select_posture, AvailabilityPosture};
 #[cfg(target_os = "linux")]
@@ -151,8 +151,25 @@ unsafe fn resolve<T>(name: &[u8]) -> T {
     std::mem::transmute_copy::<*mut c_void, T>(&p)
 }
 
+/// Defense-in-depth (CR-2): a `pthread_atfork` child handler that proactively
+/// fails-closed every inherited session the instant a fork() returns in the
+/// child — before any I/O. Best-effort and deadlock-safe: `try_lock` so a lock
+/// held by another thread at fork time cannot wedge the child. The authoritative
+/// guard remains the fork-aware token check in `FdState::is_inherited`, which
+/// catches anything skipped here at seal/open time.
+extern "C" fn atfork_child_poison_registry() {
+    if let Ok(states) = REGISTRY.try_lock() {
+        for st in states.values() {
+            if let Ok(mut s) = st.try_lock() {
+                s.fail_closed();
+            }
+        }
+    }
+}
+
 fn real() -> &'static RealSyms {
     REAL.get_or_init(|| unsafe {
+        libc::pthread_atfork(None, None, Some(atfork_child_poison_registry));
         RealSyms {
             connect: resolve::<ConnectFn>(b"connect\0"),
             send: resolve::<SendFn>(b"send\0"),
@@ -846,7 +863,11 @@ unsafe fn overlay_recv(fd: c_int, buf: *mut c_void, len: size_t, flags: c_int) -
 }
 
 fn inherited_after_fork(st: &mut FdState) -> bool {
-    if st.owner_pid == current_pid() {
+    // CR-2: fail closed if this session was inherited across fork(). The
+    // fork-aware process token (bumped by the pthread_atfork child handler) is
+    // the authoritative check; the live PID is a backstop. Either mismatch ⇒ a
+    // forked child must NOT reuse the parent's key/nonce state.
+    if !st.is_inherited() {
         return false;
     }
     st.fail_closed();
