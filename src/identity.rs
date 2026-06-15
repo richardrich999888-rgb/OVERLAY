@@ -139,6 +139,22 @@ fn mldsa_verify(pubk: &[u8], msg: &[u8], sig: &[u8]) -> Result<(), IdentityError
         .map_err(|_| IdentityError::BadSignature)
 }
 
+/// Public hybrid verification: BOTH the Ed25519 and the ML-DSA-65 signature must
+/// verify over `msg` (fail-closed — either failing rejects). Reuses the same
+/// primitive verifiers as the rest of the identity layer, so there is no logic
+/// divergence. Used by the air-gap bundle signing layer (`crate::airgap`).
+pub fn verify_hybrid(
+    ed25519_pub: &[u8],
+    mldsa65_pub: &[u8],
+    msg: &[u8],
+    ed25519_sig: &[u8],
+    mldsa65_sig: &[u8],
+) -> Result<(), IdentityError> {
+    ed_verify(ed25519_pub, msg, ed25519_sig)?;
+    mldsa_verify(mldsa65_pub, msg, mldsa65_sig)?;
+    Ok(())
+}
+
 // ------------------------------- signer abstraction -------------------------------
 
 /// The private-key operation, abstracted so the key can live in software, a TPM,

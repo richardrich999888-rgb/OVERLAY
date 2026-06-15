@@ -17,6 +17,7 @@
 
 #[cfg(feature = "cdac-accel")]
 pub mod accelerator;
+pub mod airgap;
 pub mod benchmarks;
 pub mod crypto;
 pub mod fd_passing;

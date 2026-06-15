@@ -413,4 +413,63 @@ int syntriass_policy_hier_bench(struct bpf_sock_addr *ctx) {
     return 1;
 }
 
+// HI-1 remediation — IPv6 egress coverage. The policy decision (quarantine +
+// hierarchical resolve + posture) is cgroup-keyed and therefore address-family
+// independent; only the per-flow session_state key uses the destination, so this
+// mirror builds an IPv6 flow key from the low 64 bits of the v6 address. Without
+// this program, an application egressing over IPv6 bypassed the policy entirely
+// (fail-open). Compile-verified here; attach/enforcement validation on a live
+// kernel is the deployment step (see docs/EGRESS_COVERAGE_REVIEW.md).
+SEC("cgroup/connect6")
+int syntriass_policy_hier6(struct bpf_sock_addr *ctx) {
+    __u64 cgid = bpf_get_current_cgroup_id();
+    __u16 dport = bpf_ntohs(ctx->user_port);
+    // Low 64 bits of the v6 destination + port form a per-flow key (best-effort;
+    // the security decision does not depend on it).
+    __u64 a = ((__u64)ctx->user_ip6[2] << 32) | (__u64)ctx->user_ip6[3];
+    __u64 flowkey = (a << 16) | dport;
+
+    if (syntriass_quarantined(cgid)) {
+        emit_event(ctx, cgid, 0, MODE_FAIL_CLOSED, 1, REASON_QUARANTINE, LEVEL_GLOBAL,
+                   EV_QUARANTINE);
+        return 0; // deny (EPERM)
+    }
+
+    __u32 level = LEVEL_GLOBAL;
+    struct syntriass_policy *pol = syntriass_resolve(cgid, flowkey, &level);
+
+    __u32 posture;
+    __u16 reason;
+    __u64 policy_id = 0;
+    if (!pol) {
+        posture = MODE_FAIL_CLOSED;
+        reason = REASON_NO_POLICY;
+    } else {
+        posture = pol->posture;
+        reason = (posture == MODE_FAIL_CLOSED) ? REASON_FAILCLOSED : REASON_OK;
+        policy_id = pol->policy_id;
+    }
+    __u16 decision = (posture == MODE_FAIL_CLOSED) ? 1 : 0;
+
+    if (decision == 0 && pol && posture == MODE_ENCRYPTED_FALLBACK) {
+        __u32 cf = pol->crypto_flags;
+        if ((cf & CRYPTO_FULL_PQC_ONLY) || !(cf & CRYPTO_FALLBACK_ALLOWED)) {
+            decision = 1;
+            reason = REASON_CRYPTO;
+        }
+    }
+
+    if (decision == 0) {
+        __u8 st = (__u8)(posture + 1);
+        bpf_map_update_elem(&session_state, &flowkey, &st, BPF_ANY);
+    }
+
+    __u8 audit = pol ? pol->audit_enabled : 1;
+    if (audit) {
+        __u16 etype = event_category(decision, reason, posture);
+        emit_event(ctx, cgid, policy_id, (__u16)posture, decision, reason, level, etype);
+    }
+    return decision ? 0 : 1;
+}
+
 char LICENSE[] SEC("license") = "GPL";
